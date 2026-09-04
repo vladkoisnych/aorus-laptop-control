@@ -37,6 +37,11 @@ while [ $# -gt 0 ]; do
   shift
 done
 
+# `cmd | grep -q PATTERN` is a trap under `set -o pipefail`: grep -q exits on the
+# first match, the writer dies of SIGPIPE, and the pipeline reports 141 even
+# though the pattern matched. Capture the output first and match against that.
+contains() { case "$2" in *"$1"*) return 0 ;; *) return 1 ;; esac; }
+
 R=$'\e[31m'; G=$'\e[32m'; Y=$'\e[33m'; B=$'\e[1m'; N=$'\e[0m'
 ok()   { echo "${G}  ok${N}   $*"; }
 warn() { echo "${Y}  warn${N} $*"; }
@@ -182,8 +187,9 @@ step "6. Building the kernel module (DKMS)"
     DRIVER_OK=0
     warn "no source, nothing to build"
   else
-  if dkms status 2>/dev/null | grep -q "^aorus-laptop"; then
-    OLD=$(dkms status | grep "^aorus-laptop" | head -1 | sed 's|^aorus-laptop[/,] *\([^,]*\).*|\1|')
+  DKMS_ST=$(dkms status 2>/dev/null)
+  if contains "aorus-laptop" "$DKMS_ST"; then
+    OLD=$(printf '%s\n' "$DKMS_ST" | grep "^aorus-laptop" | head -1 | sed 's|^aorus-laptop[/,] *\([^,]*\).*|\1|')
     warn "aorus-laptop/$OLD already in the DKMS tree - removing it first"
     do_ dkms remove "aorus-laptop/$OLD" --all >/dev/null 2>&1
     do_ rm -rf "/usr/src/aorus-laptop-$OLD"
@@ -216,7 +222,8 @@ step "7. Loading the module"
     fi
     do_ modprobe aorus-laptop 2>/tmp/aorus-modprobe.err
     if [ "$CHECK" = 0 ]; then
-      if lsmod | grep -q '^aorus_laptop'; then
+      LOADED=$(lsmod)
+      if contains "aorus_laptop" "$LOADED"; then
         ok "aorus_laptop loaded"
         if [ -e /sys/devices/platform/aorus_laptop/fan_mode ]; then
           ok "control nodes present: /sys/devices/platform/aorus_laptop/"
@@ -224,7 +231,7 @@ step "7. Loading the module"
           warn "module loaded but bound to nothing. dmesg says:"
           dmesg | tail -20 | grep -i 'aorus\|wmi' | sed 's/^/       /' || true
         fi
-      elif grep -qi 'key was rejected\|required key not available' /tmp/aorus-modprobe.err 2>/dev/null; then
+      elif grep -i 'key was rejected\|required key not available' /tmp/aorus-modprobe.err >/dev/null 2>&1; then
         warn "the kernel rejected the module's signature."
         warn "The key is signed but not yet enrolled in your firmware."
         warn "The last step of this installer will queue it; then reboot and approve it."
@@ -274,8 +281,15 @@ if [ "$CHECK" = 0 ]; then
 fi
 
 if [ "$CHECK" = 0 ] && [ "$NO_DRIVER" = 0 ] && [ "$SB_ON" = 1 ]; then
-  if ! mokutil --test-key /var/lib/shim-signed/mok.der 2>/dev/null | grep -qi "already enrolled" &&
-     ! mokutil --test-key /var/lib/dkms/mok.pub 2>/dev/null | grep -qi "already enrolled"; then
+  ENROLLED=0
+  for c in /var/lib/shim-signed/mok.der /var/lib/dkms/mok.pub; do
+    [ -f "$c" ] || continue
+    TK=$(mokutil --test-key "$c" 2>/dev/null)
+    contains "already enrolled" "$TK" && ENROLLED=1
+  done
+  if [ "$ENROLLED" = 1 ]; then
+    ok "signing key already enrolled, no reboot needed"
+  else
     step "11. Enrolling the signing key (one time, needs a reboot)"
     "$HERE/secureboot.sh" enroll
     echo
