@@ -299,6 +299,14 @@ if [ "$CHECK" = 0 ] && [ "$NO_DRIVER" = 0 ] && [ "$SB_ON" = 1 ]; then
   fi
 fi
 
+if [ -d "$HERE/gnome-extension" ] && command -v gnome-shell >/dev/null; then
+  echo
+  echo "${B}GNOME top bar${N}"
+  echo "  There is a shell extension in gnome-extension/. Install it as your"
+  echo "  normal user, not with sudo:"
+  echo "     cd gnome-extension && ./install.sh"
+fi
+
 echo
 echo "${B}Done.${N}"
 echo "  aorusctl status          snapshot"

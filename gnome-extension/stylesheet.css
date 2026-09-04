@@ -1,0 +1,120 @@
+/* Matches the aorusctl web dashboard: monospace, hairlines, one warm accent.
+ *
+ * Two rules keep this readable whatever theme GNOME is wearing:
+ *   1. Popup text sets no colour of its own, so it inherits the shell menu's
+ *      foreground and is correct on a light or a dark popup either way.
+ *      Dimming is done with actor opacity in extension.js, since St's CSS
+ *      has no opacity property.
+ *   2. Only the accent and the temperature colours are themed, through the
+ *      .aorusctl-light class that extension.js sets from the desktop setting.
+ */
+
+.aorusctl-panel {
+    spacing: 6px;
+}
+
+.aorusctl-icon {
+    margin-right: 2px;
+}
+
+.aorusctl-panel-label {
+    font-family: monospace;
+    font-size: 12px;
+    font-weight: 500;
+    font-feature-settings: "tnum";
+    /*text-shadow: 0 0 1px rgba(0, 0, 0, 0.55); */
+}
+
+/* ---- popup ---- */
+
+.aorusctl-item {
+    padding: 6px 4px;
+}
+
+.aorusctl-menu {
+    min-width: 260px;
+    spacing: 1px;
+    font-family: monospace;
+}
+
+.aorusctl-heading {
+    font-size: 11px;
+    font-weight: 700;
+    margin: 10px 0 4px 0;
+}
+
+.aorusctl-menu > .aorusctl-heading:first-child {
+    margin-top: 2px;
+}
+
+.aorusctl-row {
+    padding: 2px 0;
+}
+
+.aorusctl-key {
+    font-size: 12px;
+}
+
+.aorusctl-val {
+    font-size: 12px;
+    font-weight: 500;
+    font-feature-settings: "tnum";
+    text-align: right;
+}
+
+/* ---- quick fan mode buttons ---- */
+
+.aorusctl-modes {
+    spacing: 6px;
+    margin: 12px 0 2px 0;
+}
+
+.aorusctl-btn {
+    font-family: monospace;
+    font-size: 12px;
+    padding: 4px 10px;
+    border: 1px solid rgba(127, 127, 127, 0.45);
+    border-radius: 0;
+    background-color: transparent;
+}
+
+.aorusctl-btn:hover {
+    border-color: rgba(127, 127, 127, 0.9);
+}
+
+.aorusctl-btn-on {
+    color: #cf7326;
+    border-color: #cf7326;
+}
+
+.aorusctl-status {
+    font-size: 11px;
+    margin-top: 8px;
+    max-width: 260px;
+}
+
+/* ---- panel label temperature colours ----
+ * The top bar and the popup do not share a background: GNOME can pair a dark
+ * panel with a light menu. These are mid-tones chosen to clear 3.8:1 against
+ * both a dark and a light panel, so the label stays readable in every
+ * combination rather than only the one the desktop setting implies. */
+
+.aorusctl-ok   { color: #438c31; }
+.aorusctl-warn { color: #9c7a1c; }
+.aorusctl-hot  { color: #c95a47; }
+.aorusctl-dim  { color: #7d7c7a; }
+
+/* ---- light desktop ---- */
+
+.aorusctl-light .aorusctl-panel-label,
+.aorusctl-light.aorusctl-panel-label {
+    /*text-shadow: 0 0 1px rgba(255, 255, 255, 0.75); */
+}
+
+.aorusctl-light .aorusctl-btn-on {
+    color: #9e4712;
+    border-color: #9e4712;
+}
+
+/* Only the outline direction and the accent follow the desktop setting. The
+ * temperature colours above are deliberately left alone. */
