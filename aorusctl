@@ -26,7 +26,7 @@ import threading
 import time
 from pathlib import Path
 
-VERSION = "1.1.1"
+VERSION = "1.2.0"
 
 # ----------------------------------------------------------------------------
 # paths
@@ -632,6 +632,50 @@ class Gpu:
                 out[k] = v
         return out
 
+    def power_detail(self):
+        """Parse `nvidia-smi -q -d POWER`. Some laptop vBIOSes report the
+        enforced limit only here and leave the CSV query as N/A."""
+        if not self.smi:
+            return {}
+        p = run([self.smi, "-q", "-d", "POWER"])
+        if not p or p.returncode != 0:
+            return {}
+        out = {}
+        for line in p.stdout.splitlines():
+            if ":" not in line:
+                continue
+            k, _, v = line.partition(":")
+            k, v = k.strip(), v.strip()
+            if not k or v in ("N/A", "[N/A]", "[Not Supported]"):
+                continue
+            try:
+                out[k] = float(v.split()[0])
+            except (ValueError, IndexError):
+                out[k] = v
+        return out
+
+    def enforced_limit_w(self):
+        """Best available reading of the limit actually in force."""
+        q = self.query() or {}
+        if q.get("power.limit") is not None:
+            return q["power.limit"]
+        d = self.power_detail()
+        for k in ("Current Power Limit", "Requested Power Limit", "Power Limit"):
+            v = d.get(k)
+            if isinstance(v, float):
+                return v
+        return None
+
+    def powerd_active(self):
+        """nvidia-powerd drives Dynamic Boost and rewrites the power limit
+        continuously, so anything set with -pl is overwritten within seconds."""
+        p = run(["systemctl", "is-active", "nvidia-powerd"])
+        return bool(p and p.stdout.strip() == "active")
+
+    def persistence_on(self):
+        p = run([self.smi, "--query-gpu=persistence_mode", "--format=csv,noheader"])
+        return bool(p and p.returncode == 0 and p.stdout.strip().lower().startswith("enabled"))
+
     def set_power_limit(self, watts):
         if not self.smi:
             raise Err("nvidia-smi not found")
@@ -642,16 +686,56 @@ class Gpu:
         w = clamp(float(watts), lo, hi)
         STATE.remember("gpu_power_limit", q.get("power.default_limit") or q.get("power.limit"))
         if DRY_RUN:
-            print(f"  [dry-run] nvidia-smi -pl {w:.0f}")
+            print(f"  [dry-run] nvidia-smi -pm 1; nvidia-smi -pl {w:.0f}")
             return f"would set {w:.0f} W"
+
+        # Without persistence mode the driver tears down GPU state whenever the
+        # last client exits, and the limit goes back to default with it. This is
+        # the usual reason a limit appears to take and then quietly reverts.
+        turned_on_persistence = False
+        if not self.persistence_on():
+            r = run([self.smi, "-pm", "1"])
+            turned_on_persistence = bool(r and r.returncode == 0 and self.persistence_on())
+
         p = run([self.smi, "-pl", f"{w:.0f}"])
         if p is None or p.returncode != 0:
             msg = (p.stderr or p.stdout).strip() if p else "no output"
             raise Err(f"nvidia-smi -pl failed: {msg}\n"
-                      f"  (many laptop GPUs lock the power limit in vBIOS; "
-                      f"use `aorusctl gpu clocks` or the EC's gpu_boost instead)")
+                      f"  Many laptop vBIOSes lock the power limit. Try "
+                      f"`aorusctl gpu clocks` or the EC's gpu_boost instead.")
+
+        # Trust nothing: read it back.
+        time.sleep(1.2)
+        got = self.enforced_limit_w()
+        if got is not None and abs(got - w) > 1.5:
+            hint = ""
+            if self.powerd_active():
+                hint = ("\n  nvidia-powerd is running. It manages Dynamic Boost and "
+                        "rewrites the GPU power limit continuously, so it overwrites "
+                        "anything set here within a second or two."
+                        "\n  On this chassis the working lever is the EC instead:"
+                        "\n    sudo aorusctl gpu boost 2     # let the EC grant the full budget"
+                        "\n    sudo aorusctl gpu boost 0     # hold it at the base limit"
+                        "\n  To take manual control instead, stop nvidia-powerd first"
+                        "\n  (`sudo systemctl stop nvidia-powerd`), which gives up Dynamic Boost.")
+            else:
+                hint = ("\n  Something is reasserting the limit, or the vBIOS ignores it. "
+                        "`aorusctl gpu clocks` caps the GPU by clock instead, which "
+                        "laptop vBIOSes generally do honour.")
+            raise Err(f"asked for {w:.0f} W but the GPU is still at {got:.0f} W.{hint}")
+
         STATE.set_current("gpu_power_limit", w)
-        return f"GPU power limit -> {w:.0f} W (range {lo:.0f}-{hi:.0f} W)"
+        msg = f"GPU power limit -> {w:.0f} W (range {lo:.0f}-{hi:.0f} W)"
+        if got is None:
+            msg += "\n  Could not read the limit back, so this is unconfirmed."
+        if turned_on_persistence:
+            STATE.remember("gpu_persistence", 0)
+            msg += ("\n  Persistence mode was off, so the limit would have reverted as soon"
+                    " as the GPU went idle. It is on now."
+                    "\n  That keeps the dGPU initialised and costs battery on a laptop."
+                    " `sudo nvidia-smi -pm 0` turns it off again,"
+                    "\n  and so does `aorusctl reset`.")
+        return msg
 
     def set_clocks(self, lo, hi):
         if not self.smi:
@@ -757,6 +841,8 @@ def snapshot():
             "mem_used_mb": g.get("memory.used"),
             "mem_total_mb": g.get("memory.total"),
             "fan_pct": g.get("fan.speed"),
+            "powerd": gpu.powerd_active(),
+            "persistence": gpu.persistence_on(),
         } if g else {"available": gpu.available, "name": None}),
     }
 
@@ -818,6 +904,12 @@ def cmd_status(args):
         if g["power_min_w"]:
             print(f"  limit range    {fmt(g['power_min_w'], '')}-{fmt(g['power_max_w'], ' W')}"
                   f"  (default {fmt(g['power_default_w'], ' W')})")
+        if g.get("powerd"):
+            print("  nvidia-powerd  running, so it owns the power limit and will "
+                  "overwrite `gpu limit`")
+            print("                 use `aorusctl gpu boost 0|1|2` to steer it from the EC")
+        elif g.get("persistence") is False:
+            print("  persistence    off, so limits reset when the last GPU client exits")
     else:
         print("  nvidia-smi unavailable")
     print()
@@ -1137,6 +1229,9 @@ def cmd_reset(args):
 
     if gpu.available:
         msgs += gpu.reset()
+        if STATE.original("gpu_persistence") == 0 and not DRY_RUN:
+            if run([gpu.smi, "-pm", "0"]):
+                msgs.append("GPU persistence mode -> off")
 
     if not DRY_RUN:
         STATE.data = {}
@@ -1278,7 +1373,7 @@ input[type=range]{width:100%;accent-color:var(--acc)}
 .row{display:flex;align-items:center;gap:10px;margin-top:10px}
 .row label{font-size:12px;color:var(--dim);min-width:74px}
 .row output{font-variant-numeric:tabular-nums;min-width:52px;text-align:right}
-#msg{padding:0 20px 16px;color:var(--dim);font-size:12px;min-height:18px}
+#msg{margin:0 20px 20px;padding:0;color:var(--dim);font-size:12px;min-height:18px;white-space:pre-wrap;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;line-height:1.6}#msg.hot,#msg.ok{padding:10px 12px;border-radius:8px;border:1px solid var(--line);background:var(--card)}#msg.hot{border-color:#5c2626}
 .hot{color:var(--hot)}.warn{color:var(--warn)}.ok{color:var(--ok)}
 .ro{opacity:.5;pointer-events:none}
 </style></head><body>
@@ -1308,7 +1403,13 @@ input[type=range]{width:100%;accent-color:var(--acc)}
  <canvas id="cgt" data-max="95" data-min="30"></canvas>
  <table id="gtab"></table>
  <div class="row" data-ctl><label>Power cap</label><input type="range" id="gpl" min="20" max="150" step="1"><output id="gplo"></output></div>
- <div data-ctl><button data-act="gpu_reset">Reset GPU limits</button></div>
+ <p id="gplwarn" style="color:var(--warn);font-size:11px;margin:4px 0 0"></p>
+ <div data-ctl>
+  <button data-act="gpu_boost" data-v="0">EC boost off</button>
+  <button data-act="gpu_boost" data-v="1">EC boost on</button>
+  <button data-act="gpu_boost" data-v="2">EC boost max</button>
+  <button data-act="gpu_reset">Reset GPU limits</button>
+ </div>
 </section>
 
 <section class="card"><h2>Fans</h2>
@@ -1383,7 +1484,7 @@ async function tick(){
  const pl={}; (c.constraints||[]).forEach(k=>pl[k.name]=k);
  tab('ctab',[['governor',c.governor],['epp',c.epp],
   ['PL1 / PL2',(pl.long_term?f(pl.long_term.limit_w,0,' W'):'--')+' / '+(pl.short_term?f(pl.short_term.limit_w,0,' W'):'--')],
-  ['perf window',f(c.min_perf_pct)+'–'+f(c.max_perf_pct)+' %'],
+  ['perf window',f(c.min_perf_pct)+' to '+f(c.max_perf_pct)+' %'],
   ['turbo',c.turbo==null?null:(c.turbo?'on':'off')],['platform profile',c.platform_profile],
   ['peak core',c.freq_mhz_max?f(c.freq_mhz_max,0,' MHz'):null]]);
  if(pl.long_term&&fresh('pl1')){const e=document.getElementById('pl1');
@@ -1402,13 +1503,17 @@ async function tick(){
  document.getElementById('gu').textContent=f(g.util_pct);
  push('cgt',g.temp_c); draw('cgt',col(g.temp_c));
  tab('gtab',[['gpu',g.name],['power limit',g.power_limit_w?f(g.power_limit_w,0,' W'):null],
-  ['limit range',g.power_min_w?f(g.power_min_w,0)+'–'+f(g.power_max_w,0,' W'):null],
+  ['limit range',g.power_min_w?f(g.power_min_w,0)+' to '+f(g.power_max_w,0,' W'):null],
   ['vram',g.mem_total_mb?f(g.mem_used_mb,0)+' / '+f(g.mem_total_mb,0,' MB'):null],
   ['mem clock',g.clock_mem_mhz?f(g.clock_mem_mhz,0,' MHz'):null],
-  ['ec gpu boost',s.fan.gpu_boost]]);
+  ['ec gpu boost',s.fan.gpu_boost],
+  ['nvidia-powerd',g.powerd?'running (it owns the power cap)':null],
+  ['persistence',g.persistence===false?'off':null]]);
  if(g.power_limit_w&&fresh('gpl')){const e=document.getElementById('gpl');
   e.min=Math.round(g.power_min_w||20);e.max=Math.round(g.power_max_w||150);
   e.value=Math.round(g.power_limit_w);document.getElementById('gplo').textContent=e.value+' W';}
+ const gw=document.getElementById('gplwarn');
+ if(gw)gw.textContent=g.powerd?'nvidia-powerd rewrites this continuously. Use EC boost below.':'';
 
  document.getElementById('fm').textContent=fa.mode||'--';
  document.getElementById('fd').textContent=f(fa.pwm_pct);
@@ -1523,6 +1628,8 @@ def cmd_web(args):
                     cpu.set_turbo(str(v) == "1"); msg = f"turbo {'on' if str(v) == '1' else 'off'}"
                 elif a == "gpu_power_limit":
                     msg = gpu.set_power_limit(float(v))
+                elif a == "gpu_boost":
+                    fans.set_gpu_boost(int(v)); msg = f"EC gpu_boost {v}"
                 elif a == "gpu_reset":
                     msg = "; ".join(gpu.reset()) or "nothing to reset"
                 elif a == "profile":
@@ -1654,6 +1761,14 @@ def cmd_gpu(args):
             raise Err("nvidia-smi returned nothing (is the dGPU powered / driver loaded?)")
         for k, v in q.items():
             print(f"{k:<24} {v}")
+        print(f"{'enforced limit (read back)':<24} {gpu.enforced_limit_w()}")
+        print(f"{'persistence mode':<24} {'on' if gpu.persistence_on() else 'off'}")
+        print(f"{'nvidia-powerd':<24} {'running' if gpu.powerd_active() else 'not running'}")
+        d = gpu.power_detail()
+        if d:
+            print("\nnvidia-smi -q -d POWER:")
+            for k, v in d.items():
+                print(f"  {k:<32} {v}")
         return 0
     need_root()
     if args.gpu_cmd == "limit":

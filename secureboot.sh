@@ -59,6 +59,20 @@ find_module() {
 
 sb_state() { mokutil --sb-state 2>/dev/null | head -1; }
 
+# See the note in install.sh: grep -q under pipefail reports SIGPIPE, not the
+# match. Everything below matches against captured output instead.
+contains() { case "$2" in *"$1"*) return 0 ;; *) return 1 ;; esac; }
+
+is_enrolled() {
+  local out; out=$(mokutil --test-key "$1" 2>/dev/null)
+  contains "already enrolled" "$out"
+}
+
+is_loaded() {
+  local out; out=$(lsmod 2>/dev/null)
+  contains "${MODNAME//-/_}" "$out"
+}
+
 cmd_status() {
   step "Secure Boot"
   local s; s=$(sb_state)
@@ -72,7 +86,7 @@ cmd_status() {
   if find_key; then
     ok "key  $KEY"
     ok "cert $CRT"
-    if mokutil --test-key "$CRT" 2>/dev/null | grep -qi "already enrolled"; then
+    if is_enrolled "$CRT"; then
       ok "enrolled in the firmware"
     else
       warn "NOT enrolled yet - run: sudo $0 enroll"
@@ -91,7 +105,7 @@ cmd_status() {
   fi
 
   step "Loaded?"
-  if lsmod | grep -q "^${MODNAME//-/_}"; then
+  if is_loaded; then
     ok "${MODNAME//-/_} is loaded"
   else
     warn "not loaded. modprobe says:"
@@ -184,8 +198,8 @@ cmd_sign() {
 
 cmd_enroll() {
   find_key || { bad "no signing key; run: sudo $0 setup"; return 1; }
-  if mokutil --test-key "$CRT" 2>/dev/null | grep -qi "already enrolled"; then
-    ok "already enrolled, nothing to do"
+  if is_enrolled "$CRT"; then
+    ok "already enrolled, nothing to do. No reboot needed."
     return 0
   fi
   step "Enrolling the key"

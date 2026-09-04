@@ -47,7 +47,10 @@ CPU power and frequency ceilings use mainline sysfs: `intel-rapl` powercap,
 `intel_pstate` and `cpufreq`.
 
 GPU power and clock ceilings go through `nvidia-smi -pl` and `-lgc`, which clamp
-to whatever the vBIOS allows.
+to whatever the vBIOS allows. On laptops running `nvidia-powerd` the power limit
+belongs to that daemon, so the EC's Dynamic Boost toggle is the lever that
+actually works. Every GPU write is read back and a change that did not stick is
+reported as a failure rather than assumed.
 
 Nothing here writes `/dev/port`, sets `ec_sys write_support=1`, or pokes MSRs.
 That is how people brick the EC on these machines, and why the `p37-ec-*`
@@ -152,6 +155,7 @@ sudo aorusctl cpu epp power
 aorusctl cpu show
 
 sudo aorusctl gpu limit 100        # watts, clamped to what the vBIOS allows
+sudo aorusctl gpu boost 2          # EC Dynamic Boost: 0 off, 1 on, 2 max
 sudo aorusctl gpu clocks 210,1800  # hard SM clock lock, MHz
 sudo aorusctl gpu reset
 aorusctl gpu show
@@ -293,8 +297,17 @@ Common problems:
   The probe report distinguishes the two.
 - CPU watts shows `--`. Since the RAPL side-channel mitigation, `energy_uj` is
   readable only by root, so run with `sudo`.
-- `gpu limit` fails. Many laptop vBIOSes lock the power limit. Use `aorusctl gpu
-  clocks` or the EC's `gpu_boost` instead.
+- `gpu limit` reverts to the default a moment after you set it. Two causes,
+  and `aorusctl gpu show` names which one you have. Persistence mode off is the
+  common one: the driver tears down GPU state whenever the last client exits and
+  the limit goes with it, so the tool now turns persistence on before setting a
+  limit. That keeps the dGPU initialised and costs battery, and `aorusctl reset`
+  puts it back. The other is `nvidia-powerd`, which owns the power limit on
+  laptops with Dynamic Boost and rewrites it every second or so. Steer the budget
+  from the EC with `aorusctl gpu boost 0|1|2` instead, or stop `nvidia-powerd` to
+  take manual control and give up Dynamic Boost. Some vBIOSes also ignore the
+  limit outright, in which case `aorusctl gpu clocks` caps the GPU by clock,
+  which they generally do honour.
 - PL1 will not go above some value. The MMIO RAPL domain often carries a
   firmware cap, and the lower of the MSR and MMIO limits wins. `aorusctl cpu
   show` prints both, `status` prints the effective one.
