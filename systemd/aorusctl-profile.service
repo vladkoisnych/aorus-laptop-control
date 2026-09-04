@@ -1,0 +1,14 @@
+[Unit]
+Description=Apply an aorusctl profile at boot
+After=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Change "balanced" to whichever profile in /etc/aorusctl/config.toml you want
+# applied on every boot.
+ExecStart=/usr/local/bin/aorusctl profile apply balanced
+ExecStop=/usr/local/bin/aorusctl reset
+
+[Install]
+WantedBy=multi-user.target

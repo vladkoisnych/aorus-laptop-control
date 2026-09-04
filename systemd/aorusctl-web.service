@@ -1,0 +1,14 @@
+[Unit]
+Description=aorusctl dashboard (http://127.0.0.1:8787)
+After=network.target
+
+[Service]
+Type=simple
+# Bound to loopback. Change --bind only if you understand that it exposes
+# fan, CPU and GPU controls to anything that can reach this machine.
+ExecStart=/usr/local/bin/aorusctl web --bind 127.0.0.1 --port 8787
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

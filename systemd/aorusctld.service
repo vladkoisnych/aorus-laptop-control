@@ -1,0 +1,22 @@
+[Unit]
+Description=aorusctl software fan curve and thermal guard
+Documentation=file:///etc/aorusctl/config.toml
+After=multi-user.target
+# If the daemon dies repeatedly, stop trying and leave the firmware in charge.
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/aorusctl daemon
+# Put the fans back under firmware control whatever happens to us, unless the
+# daemon stood down because someone picked a fan mode, in which case that choice
+# is left alone.
+ExecStopPost=/usr/local/bin/aorusctl daemon-cleanup
+Restart=on-failure
+RestartSec=5
+Nice=-5
+OOMScoreAdjust=-500
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,2182 @@
+#!/usr/bin/env python3
+"""
+aorusctl - fan, CPU and GPU control plus live dashboard for Gigabyte AORUS /
+AERO laptops running Linux. Built for the AORUS 16X (i7-14650HX + RTX 4070)
+but it is written against generic interfaces and degrades gracefully.
+
+Control paths used, in order of preference:
+  fans   : aorus-laptop WMI kernel driver (/sys/devices/platform/aorus_laptop)
+  cpu    : intel-rapl powercap + intel_pstate + cpufreq (all mainline sysfs)
+  gpu    : nvidia-smi (power limit, locked clocks)
+
+Nothing here pokes the embedded controller directly. Every write is clamped,
+logged, recorded for rollback, and reversible with `aorusctl reset`.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+VERSION = "1.5.0"
+
+# ----------------------------------------------------------------------------
+# paths
+# ----------------------------------------------------------------------------
+
+AORUS = Path("/sys/devices/platform/aorus_laptop")
+POWERCAP = Path("/sys/class/powercap")
+PSTATE = Path("/sys/devices/system/cpu/intel_pstate")
+CPUBASE = Path("/sys/devices/system/cpu")
+HWMON = Path("/sys/class/hwmon")
+PLATFORM_PROFILE = Path("/sys/firmware/acpi/platform_profile")
+
+STATE_DIR = Path("/var/lib/aorusctl")
+STATE_FILE = STATE_DIR / "state.json"
+# Written when aorusctld stands down because someone picked a fan mode. The
+# unit's ExecStopPost checks it so that handing the fans back to the firmware
+# after a kill does not also undo a mode the user just chose.
+YIELD_FLAG = Path("/run/aorusctl-daemon-yielded")
+CONFIG_FILE = Path("/etc/aorusctl/config.toml")
+
+FAN_MODES = ["normal", "silent", "gaming", "custom", "auto", "fixed"]
+
+# Top of the EC's duty scale. The aorus-laptop driver passes the value straight
+# through to the firmware without clamping, and on this family the EC's range is
+# 0-229 (0xE5), not 0-255: writing 230 or more lands outside it and the fans stop
+# instead of speeding up. Override with fan_duty_max in config.toml if your model
+# differs.
+FAN_DUTY_MAX = 229
+
+DRY_RUN = False
+VERBOSE = False
+
+
+# ----------------------------------------------------------------------------
+# small helpers
+# ----------------------------------------------------------------------------
+
+class Err(Exception):
+    pass
+
+
+def log(msg: str) -> None:
+    if VERBOSE:
+        sys.stderr.write(f"[aorusctl] {msg}\n")
+
+
+def is_root() -> bool:
+    return os.geteuid() == 0
+
+
+def need_root() -> None:
+    if not is_root() and not DRY_RUN:
+        raise Err("this needs root - rerun with sudo (or add --dry-run to see what would happen)")
+
+
+def rd(path, default=None, strip=True):
+    """Read a sysfs file. Never raises."""
+    try:
+        v = Path(path).read_text()
+        return v.strip() if strip else v
+    except Exception:
+        return default
+
+
+def rdint(path, default=None):
+    v = rd(path)
+    if v is None:
+        return default
+    try:
+        return int(v.split()[0])
+    except Exception:
+        return default
+
+
+def wr(path, value) -> bool:
+    """Write a sysfs file. Returns True on success, records nothing itself."""
+    path = Path(path)
+    value = str(value)
+    if DRY_RUN:
+        print(f"  [dry-run] write {value!r} -> {path}")
+        return True
+    try:
+        path.write_text(value)
+        log(f"wrote {value!r} -> {path}")
+        return True
+    except PermissionError:
+        if is_root():
+            raise Err(
+                f"the driver refused the write to {path.name}.\n"
+                f"  This is EPERM while running as root, so it is not a permissions problem.\n"
+                f"  aorus-laptop returns -1 (which the kernel reports as EPERM) when the\n"
+                f"  firmware's WMI method fails, so your model most likely does not\n"
+                f"  implement this one.")
+        raise Err(f"permission denied writing {path} (need root)")
+    except OSError as e:
+        raise Err(f"kernel rejected write {value!r} -> {path}: {e}")
+
+
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+def run(cmd, check=False, timeout=15):
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except FileNotFoundError:
+        if check:
+            raise Err(f"{cmd[0]} not found")
+        return None
+    except subprocess.TimeoutExpired:
+        if check:
+            raise Err(f"{' '.join(cmd)} timed out")
+        return None
+    if check and p.returncode != 0:
+        raise Err(f"{' '.join(cmd)} failed: {(p.stderr or p.stdout).strip()}")
+    return p
+
+
+# ----------------------------------------------------------------------------
+# rollback state
+# ----------------------------------------------------------------------------
+
+class State:
+    """Remembers the first value we ever saw for anything we change."""
+
+    def __init__(self):
+        self.data = {}
+        try:
+            if STATE_FILE.exists():
+                self.data = json.loads(STATE_FILE.read_text())
+        except Exception:
+            self.data = {}
+
+    def remember(self, key, value):
+        if value is None:
+            return
+        self.data.setdefault("original", {})
+        if key not in self.data["original"]:
+            self.data["original"][key] = value
+            self.save()
+
+    def original(self, key, default=None):
+        return self.data.get("original", {}).get(key, default)
+
+    def set_current(self, key, value):
+        self.data.setdefault("current", {})[key] = value
+        self.save()
+
+    def current(self, key, default=None):
+        return self.data.get("current", {}).get(key, default)
+
+    def save(self):
+        if DRY_RUN:
+            return
+        try:
+            STATE_DIR.mkdir(parents=True, exist_ok=True)
+            tmp = STATE_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self.data, indent=2))
+            tmp.replace(STATE_FILE)
+        except Exception as e:
+            log(f"could not save state: {e}")
+
+
+STATE = State()
+
+
+# ----------------------------------------------------------------------------
+# fans - aorus-laptop WMI driver
+# ----------------------------------------------------------------------------
+
+class Fans:
+    def __init__(self):
+        self.base = AORUS
+        self.hwmon = self._find_hwmon()
+        # fan_pwm node was added in driver 0.2.0, which is also when
+        # fan_custom_speed switched from 25-100 percent to a 0-255 byte.
+        self.byte_scale = (self.base / "fan_pwm").exists()
+
+    @property
+    def available(self) -> bool:
+        return (self.base / "fan_mode").exists()
+
+    def _find_hwmon(self):
+        d = self.base / "hwmon"
+        if d.is_dir():
+            for h in sorted(d.glob("hwmon*")):
+                return h
+        # fall back: any hwmon whose name looks like ours
+        for h in sorted(HWMON.glob("hwmon*")):
+            if rd(h / "name") in ("aorus_laptop", "aorus-laptop"):
+                return h
+        return None
+
+    def why_unavailable(self) -> str:
+        if not Path("/sys/bus/wmi/devices").exists():
+            return "no WMI bus - kernel is missing the wmi driver"
+        guid = "ABBC0F6F-8EA1-11D1-00A0-C90629100000"
+        seen = [p.name.upper() for p in Path("/sys/bus/wmi/devices").glob("*")]
+        if not any(guid in s for s in seen):
+            return ("the Gigabyte WMI GUIDs are not exposed on this machine - "
+                    "the aorus-laptop driver cannot work here")
+        mods = rd("/proc/modules", "")
+        if "aorus_laptop" not in mods:
+            return ("aorus-laptop module is not loaded - run "
+                    "`sudo modprobe aorus-laptop` (install it with install.sh)")
+        return "aorus-laptop is loaded but exposed no fan_mode node"
+
+    # ---- reads
+
+    def mode(self):
+        v = rdint(self.base / "fan_mode")
+        if v is None:
+            return None
+        return FAN_MODES[v] if 0 <= v < len(FAN_MODES) else str(v)
+
+    def custom_speed_pct(self):
+        v = rdint(self.base / "fan_custom_speed")
+        if v is None:
+            return None
+        return round(v * 100 / FAN_DUTY_MAX) if self.byte_scale else v
+
+    def pwm_pct(self):
+        v = rdint(self.base / "fan_pwm")
+        return round(v * 100 / FAN_DUTY_MAX) if v is not None else None
+
+    def rpms(self):
+        out = {}
+        if not self.hwmon:
+            return out
+        names = {1: "cpu", 2: "gpu", 3: "fan3", 4: "fan4"}
+        for i, label in names.items():
+            v = rdint(self.hwmon / f"fan{i}_input")
+            if v:
+                out[label] = v
+        return out
+
+    def pwms(self):
+        out = {}
+        if not self.hwmon:
+            return out
+        for i, label in {1: "cpu", 2: "gpu"}.items():
+            v = rdint(self.hwmon / f"pwm{i}")
+            if v is not None:
+                out[label] = round(v * 100 / FAN_DUTY_MAX)
+        return out
+
+    def temps(self):
+        out = {}
+        if not self.hwmon:
+            return out
+        for i, label in {1: "cpu", 2: "gpu", 3: "board"}.items():
+            v = rdint(self.hwmon / f"temp{i}_input")
+            if v:
+                out[label] = v / 1000.0
+        return out
+
+    def curve(self):
+        """Read the 15 firmware curve points."""
+        pts = []
+        idx_node = self.base / "fan_curve_index"
+        data_node = self.base / "fan_curve_data"
+        if not idx_node.exists():
+            return pts
+        for i in range(15):
+            try:
+                wr(idx_node, i)
+            except Err:
+                return pts
+            raw = rd(data_node, "")
+            nums = [int(x) for x in raw.replace(",", " ").split() if x.lstrip("-").isdigit()]
+            if len(nums) >= 2:
+                temp, speed = nums[0], nums[1]   # driver prints temperature then speed
+            elif len(nums) == 1:
+                temp, speed = nums[0] & 0xFF, nums[0] >> 8
+            else:
+                continue
+            if self.byte_scale:
+                speed = round(speed * 100 / FAN_DUTY_MAX)
+            pts.append((temp, clamp(speed, 0, 100)))
+        return pts
+
+    def charge_limit(self):
+        return rdint(self.base / "charge_limit")
+
+    def charge_mode(self):
+        return rdint(self.base / "charge_mode")
+
+    def gpu_boost(self):
+        return rdint(self.base / "gpu_boost")
+
+    def battery_cycle(self):
+        return rdint(self.base / "battery_cycle")
+
+    # ---- writes
+
+    def set_mode(self, name):
+        if name not in FAN_MODES:
+            raise Err(f"unknown fan mode {name!r}; pick one of {', '.join(FAN_MODES)}")
+        STATE.remember("fan_mode", self.mode() or "normal")
+        wr(self.base / "fan_mode", FAN_MODES.index(name))
+        STATE.set_current("fan_mode", name)
+
+    def set_speed_pct(self, pct):
+        pct = clamp(int(pct), 0, 100)
+        STATE.remember("fan_custom_speed_pct", self.custom_speed_pct())
+        if self.byte_scale:
+            wr(self.base / "fan_custom_speed",
+               clamp(round(pct * FAN_DUTY_MAX / 100), 0, FAN_DUTY_MAX))
+        else:
+            # old driver: 25-100 and divisible by 5
+            val = clamp(int(round(pct / 5) * 5), 25, 100)
+            wr(self.base / "fan_custom_speed", val)
+        STATE.set_current("fan_custom_speed_pct", pct)
+
+    def set_curve(self, points):
+        """points: list of (temp_c, speed_pct), at most 15, non-decreasing."""
+        if not points:
+            raise Err("empty curve")
+        if len(points) > 15:
+            raise Err("the firmware curve holds at most 15 points")
+        pts = sorted((clamp(int(t), 0, 100), clamp(int(s), 0, 100)) for t, s in points)
+        last_t = last_s = -1
+        for t, s in pts:
+            if t < last_t or s < last_s:
+                raise Err("curve points must be non-decreasing in both temperature and speed")
+            last_t, last_s = t, s
+        # pad to 15 by repeating the last point
+        while len(pts) < 15:
+            pts.append(pts[-1])
+        STATE.remember("fan_curve", self.curve())
+        for i, (t, s) in enumerate(pts):
+            wr(self.base / "fan_curve_index", i)
+            wr(self.base / "fan_curve_data",
+               (clamp(round(s * FAN_DUTY_MAX / 100), 0, FAN_DUTY_MAX) << 8) | t)
+        STATE.set_current("fan_curve", pts)
+
+    def set_charge_limit(self, pct):
+        pct = clamp(int(pct), 60, 100)
+        STATE.remember("charge_mode", self.charge_mode())
+        STATE.remember("charge_limit", self.charge_limit())
+        wr(self.base / "charge_mode", 1)
+        wr(self.base / "charge_limit", pct)
+
+    def set_gpu_boost(self, v):
+        STATE.remember("gpu_boost", self.gpu_boost())
+        wr(self.base / "gpu_boost", clamp(int(v), 0, 2))
+
+
+# ----------------------------------------------------------------------------
+# cpu - powercap / intel_pstate / cpufreq
+# ----------------------------------------------------------------------------
+
+class Cpu:
+    def __init__(self):
+        self.rapl_domains = self._find_rapl()
+        self.coretemp = self._find_coretemp()
+        self._last_energy = None
+        self._last_time = None
+        self.energy_dom, self.power_note = self._find_energy_source()
+
+    def _find_energy_source(self):
+        """Pick a package domain with a readable energy counter.
+
+        Two things bite here. The MMIO twin usually has no energy_uj at all, and
+        since the RAPL side-channel mitigation (CVE-2020-8694) energy_uj is mode
+        0400, so an unprivileged read returns nothing rather than an error.
+        """
+        cands = [d for d in self.rapl_domains if (d / "energy_uj").exists()]
+        # MSR domain before the MMIO one
+        cands.sort(key=lambda d: ("mmio" in d.name, d.name))
+        for d in cands:
+            if rd(d / "energy_uj") is not None:
+                return d, None
+        if cands:
+            if not is_root():
+                return None, "energy_uj is root-readable only, so package watts needs sudo"
+            return None, "energy_uj exists but could not be read"
+        return None, "this firmware exposes no RAPL energy counter"
+
+    def _find_rapl(self):
+        """Every writable package domain (intel-rapl and its mmio twin)."""
+        out = []
+        for d in sorted(POWERCAP.glob("intel-rapl*:0")):
+            name = rd(d / "name", "")
+            if name.startswith("package"):
+                out.append(d)
+        return out
+
+    def _find_coretemp(self):
+        for h in sorted(HWMON.glob("hwmon*")):
+            if rd(h / "name") == "coretemp":
+                return h
+        return None
+
+    # ---- reads
+
+    def constraints(self):
+        """[{domain, index, name, limit_w, max_w, window_us}]"""
+        out = []
+        for d in self.rapl_domains:
+            for i in range(4):
+                lp = d / f"constraint_{i}_power_limit_uw"
+                if not lp.exists():
+                    continue
+                out.append({
+                    "domain": d.name,
+                    "index": i,
+                    "name": rd(d / f"constraint_{i}_name", f"constraint_{i}"),
+                    "limit_w": (rdint(lp) or 0) / 1_000_000,
+                    "max_w": (rdint(d / f"constraint_{i}_max_power_uw") or 0) / 1_000_000,
+                    "window_us": rdint(d / f"constraint_{i}_time_window_us"),
+                })
+        return out
+
+    def package_power_w(self):
+        """Average package watts since the previous call."""
+        if not self.energy_dom:
+            return None
+        e = rdint(self.energy_dom / "energy_uj")
+        t = time.monotonic()
+        if e is None:
+            return None
+        prev_e, prev_t = self._last_energy, self._last_time
+        self._last_energy, self._last_time = e, t
+        if prev_e is None or t <= prev_t:
+            return None
+        de = e - prev_e
+        if de < 0:  # counter wrapped
+            rng = self._energy_range()
+            de += rng
+        return de / 1_000_000 / (t - prev_t)
+
+    def _energy_range(self):
+        return rdint(self.energy_dom / "max_energy_range_uj") or 0
+
+    def temps(self):
+        out = {"package": None, "cores": []}
+        if not self.coretemp:
+            return out
+        for f in sorted(self.coretemp.glob("temp*_label")):
+            label = rd(f, "")
+            val = rdint(str(f).replace("_label", "_input"))
+            if val is None:
+                continue
+            c = val / 1000.0
+            if "Package" in label:
+                out["package"] = c
+            elif label.startswith("Core"):
+                out["cores"].append((label, c))
+        return out
+
+    def freqs_mhz(self):
+        out = []
+        for d in sorted(CPUBASE.glob("cpu[0-9]*/cpufreq"), key=lambda p: int(p.parent.name[3:])):
+            v = rdint(d / "scaling_cur_freq") or rdint(d / "cpuinfo_cur_freq")
+            if v:
+                out.append(v / 1000)
+        return out
+
+    def governor(self):
+        return rd(CPUBASE / "cpu0/cpufreq/scaling_governor")
+
+    def governors(self):
+        return (rd(CPUBASE / "cpu0/cpufreq/scaling_available_governors") or "").split()
+
+    def epp(self):
+        return rd(CPUBASE / "cpu0/cpufreq/energy_performance_preference")
+
+    def epps(self):
+        return (rd(CPUBASE / "cpu0/cpufreq/energy_performance_available_preferences") or "").split()
+
+    def max_perf_pct(self):
+        return rdint(PSTATE / "max_perf_pct")
+
+    def min_perf_pct(self):
+        return rdint(PSTATE / "min_perf_pct")
+
+    def turbo(self):
+        v = rdint(PSTATE / "no_turbo")
+        return None if v is None else (v == 0)
+
+    def platform_profile(self):
+        return rd(PLATFORM_PROFILE)
+
+    def platform_profiles(self):
+        return (rd("/sys/firmware/acpi/platform_profile_choices") or "").split()
+
+    # ---- writes
+
+    def _set_constraint(self, want_name, watts):
+        """Set a RAPL constraint by name across every package domain."""
+        done, errors = [], []
+        for d in self.rapl_domains:
+            for i in range(4):
+                lp = d / f"constraint_{i}_power_limit_uw"
+                if not lp.exists():
+                    continue
+                if rd(d / f"constraint_{i}_name", "") != want_name:
+                    continue
+                cur = rdint(lp)
+                STATE.remember(f"rapl|{d.name}|{i}", cur)
+                cap = rdint(d / f"constraint_{i}_max_power_uw") or 0
+                uw = int(watts * 1_000_000)
+                note = ""
+                # A max of 0 means the firmware did not publish one. Do not treat
+                # that as a ceiling of zero; attempt the write and let the kernel
+                # reject it if it is out of range.
+                if cap > 0 and uw > cap:
+                    uw = cap
+                    note = f"  (firmware caps this domain at {cap/1_000_000:.0f} W)"
+                try:
+                    wr(lp, uw)
+                    done.append(f"{d.name}/{want_name} -> {uw/1_000_000:.1f} W{note}")
+                except Err as e:
+                    errors.append(f"{d.name}/{want_name}: {e}")
+        if not done:
+            hint = ("; ".join(errors) if errors else
+                    f"no {want_name} constraint found - your firmware may lock RAPL")
+            raise Err(f"could not set {want_name}: {hint}")
+        return done
+
+    def set_pl1(self, watts):
+        watts = clamp(float(watts), 5, 200)
+        return self._set_constraint("long_term", watts)
+
+    def set_pl2(self, watts):
+        watts = clamp(float(watts), 5, 250)
+        return self._set_constraint("short_term", watts)
+
+    def set_max_perf_pct(self, pct):
+        pct = clamp(int(pct), 10, 100)
+        if not (PSTATE / "max_perf_pct").exists():
+            raise Err("intel_pstate is not active on this kernel")
+        STATE.remember("max_perf_pct", self.max_perf_pct())
+        wr(PSTATE / "max_perf_pct", pct)
+
+    def set_turbo(self, on: bool):
+        if not (PSTATE / "no_turbo").exists():
+            raise Err("intel_pstate no_turbo not available")
+        STATE.remember("no_turbo", rdint(PSTATE / "no_turbo"))
+        wr(PSTATE / "no_turbo", 0 if on else 1)
+
+    def set_governor(self, gov):
+        avail = self.governors()
+        if avail and gov not in avail:
+            raise Err(f"governor {gov!r} not available; have: {', '.join(avail)}")
+        STATE.remember("governor", self.governor())
+        n = 0
+        for d in sorted(CPUBASE.glob("cpu[0-9]*/cpufreq")):
+            try:
+                wr(d / "scaling_governor", gov)
+                n += 1
+            except Err:
+                pass
+        if n == 0:
+            raise Err("no cpufreq policy accepted the governor")
+        return n
+
+    def set_epp(self, pref):
+        avail = self.epps()
+        if avail and pref not in avail:
+            raise Err(f"EPP {pref!r} not available; have: {', '.join(avail)}")
+        STATE.remember("epp", self.epp())
+        n = 0
+        for d in sorted(CPUBASE.glob("cpu[0-9]*/cpufreq")):
+            p = d / "energy_performance_preference"
+            if p.exists():
+                try:
+                    wr(p, pref)
+                    n += 1
+                except Err:
+                    pass
+        if n == 0:
+            raise Err("no cpufreq policy accepted the EPP value")
+        return n
+
+    def set_platform_profile(self, name):
+        avail = self.platform_profiles()
+        if not avail:
+            raise Err("this firmware exposes no platform_profile")
+        if name not in avail:
+            raise Err(f"profile {name!r} not available; have: {', '.join(avail)}")
+        STATE.remember("platform_profile", self.platform_profile())
+        wr(PLATFORM_PROFILE, name)
+
+
+# ----------------------------------------------------------------------------
+# gpu - nvidia-smi
+# ----------------------------------------------------------------------------
+
+GPU_FIELDS = [
+    "name", "temperature.gpu", "utilization.gpu", "utilization.memory",
+    "power.draw", "power.limit", "power.default_limit",
+    "power.min_limit", "power.max_limit",
+    "clocks.sm", "clocks.mem", "memory.used", "memory.total", "fan.speed",
+]
+
+
+class Gpu:
+    def __init__(self):
+        self.smi = shutil.which("nvidia-smi")
+
+    @property
+    def available(self):
+        return self.smi is not None
+
+    def query(self):
+        if not self.smi:
+            return None
+        p = run([self.smi, f"--query-gpu={','.join(GPU_FIELDS)}",
+                 "--format=csv,noheader,nounits"])
+        if not p or p.returncode != 0 or not p.stdout.strip():
+            return None
+        parts = [x.strip() for x in p.stdout.strip().splitlines()[0].split(",")]
+        out = {}
+        for k, v in zip(GPU_FIELDS, parts):
+            if v in ("[N/A]", "[Not Supported]", "N/A", ""):
+                out[k] = None
+                continue
+            try:
+                out[k] = float(v) if k != "name" else v
+            except ValueError:
+                out[k] = v
+        return out
+
+    def power_detail(self):
+        """Parse `nvidia-smi -q -d POWER`. Some laptop vBIOSes report the
+        enforced limit only here and leave the CSV query as N/A."""
+        if not self.smi:
+            return {}
+        p = run([self.smi, "-q", "-d", "POWER"])
+        if not p or p.returncode != 0:
+            return {}
+        out = {}
+        for line in p.stdout.splitlines():
+            if ":" not in line:
+                continue
+            k, _, v = line.partition(":")
+            k, v = k.strip(), v.strip()
+            if not k or v in ("N/A", "[N/A]", "[Not Supported]"):
+                continue
+            try:
+                out[k] = float(v.split()[0])
+            except (ValueError, IndexError):
+                out[k] = v
+        return out
+
+    def enforced_limit_w(self):
+        """Best available reading of the limit actually in force."""
+        q = self.query() or {}
+        if q.get("power.limit") is not None:
+            return q["power.limit"]
+        d = self.power_detail()
+        for k in ("Current Power Limit", "Requested Power Limit", "Power Limit"):
+            v = d.get(k)
+            if isinstance(v, float):
+                return v
+        return None
+
+    def powerd_active(self):
+        """nvidia-powerd drives Dynamic Boost and rewrites the power limit
+        continuously, so anything set with -pl is overwritten within seconds."""
+        p = run(["systemctl", "is-active", "nvidia-powerd"])
+        return bool(p and p.stdout.strip() == "active")
+
+    def powerd_state(self):
+        """'active', 'disabled' (installed but not running), or 'absent'.
+
+        On Ada laptops Dynamic Boost is what lifts the GPU above its base TGP.
+        It is nvidia-powerd that does the lifting, so with the service off the
+        GPU sits at power.default_limit no matter what anything else asks for.
+        """
+        if self.powerd_active():
+            return "active"
+        p = run(["systemctl", "is-enabled", "nvidia-powerd"])
+        out = (p.stdout + p.stderr).strip() if p else ""
+        if not out or "not-found" in out or "No such file" in out:
+            return "absent"
+        return "disabled"
+
+    def persistence_on(self):
+        p = run([self.smi, "--query-gpu=persistence_mode", "--format=csv,noheader"])
+        return bool(p and p.returncode == 0 and p.stdout.strip().lower().startswith("enabled"))
+
+    def set_power_limit(self, watts):
+        if not self.smi:
+            raise Err("nvidia-smi not found")
+        need_root()
+        q = self.query() or {}
+        lo = q.get("power.min_limit") or 1
+        hi = q.get("power.max_limit") or 200
+        w = clamp(float(watts), lo, hi)
+        STATE.remember("gpu_power_limit", q.get("power.default_limit") or q.get("power.limit"))
+        if DRY_RUN:
+            print(f"  [dry-run] nvidia-smi -pm 1; nvidia-smi -pl {w:.0f}")
+            return f"would set {w:.0f} W"
+
+        # Without persistence mode the driver tears down GPU state whenever the
+        # last client exits, and the limit goes back to default with it. This is
+        # the usual reason a limit appears to take and then quietly reverts.
+        turned_on_persistence = False
+        if not self.persistence_on():
+            r = run([self.smi, "-pm", "1"])
+            turned_on_persistence = bool(r and r.returncode == 0 and self.persistence_on())
+
+        p = run([self.smi, "-pl", f"{w:.0f}"])
+        if p is None or p.returncode != 0:
+            msg = (p.stderr or p.stdout).strip() if p else "no output"
+            raise Err(f"nvidia-smi -pl failed: {msg}\n"
+                      f"  Many laptop vBIOSes lock the power limit. Try "
+                      f"`aorusctl gpu clocks` or the EC's gpu_boost instead.")
+
+        # Trust nothing: read it back.
+        time.sleep(1.2)
+        got = self.enforced_limit_w()
+        if got is not None and abs(got - w) > 1.5:
+            hint = ""
+            if self.powerd_active():
+                hint = ("\n  nvidia-powerd is running, which is what you want. It manages"
+                        " Dynamic Boost and rewrites"
+                        "\n  the power limit continuously, moving budget to the GPU when the"
+                        " CPU is not using its share,"
+                        "\n  so a fixed limit set here is overwritten within a second or two."
+                        " The limit is meant to move."
+                        "\n"
+                        "\n  To cap the GPU anyway, lock its clocks instead:"
+                        "\n    sudo aorusctl gpu clocks 210,1800"
+                        "\n  Or stop nvidia-powerd first (`sudo systemctl stop nvidia-powerd`),"
+                        " which gives up Dynamic Boost"
+                        "\n  and leaves the GPU at its base TGP."
+                        "\n"
+                        "\n  `aorusctl gpu boost` steers the EC instead, but not every model"
+                        " implements that WMI method;"
+                        "\n  if it returns EPERM under sudo, yours does not.")
+            else:
+                hint = ("\n  Nothing is fighting you. On laptop GPUs the power limit belongs to"
+                        " the vBIOS and platform firmware,"
+                        "\n  not the driver, so nvidia-smi accepts -pl, reports success, and the"
+                        " enforced limit never moves.")
+                if q.get("power.limit") is None:
+                    hint += ("\n  This GPU reports no enforced limit at all (power.limit is"
+                             " N/A), which is the usual sign of that.")
+                st = self.powerd_state()
+                if st == "disabled":
+                    hint += (f"\n\n  What you probably want instead: nvidia-powerd is installed"
+                             f" here but not running.\n"
+                             f"  It is what implements Dynamic Boost, so with it off the GPU"
+                             f" stays at its {q.get('power.default_limit') or 'base'} W base TGP"
+                             f" and never reaches the"
+                             f" {q.get('power.max_limit') or 'higher'} W ceiling.\n"
+                             f"    sudo systemctl enable --now nvidia-powerd\n"
+                             f"  It then raises the limit itself when CPU headroom allows, which"
+                             f" is the only route to the full budget.")
+                elif st == "absent":
+                    hint += ("\n\n  nvidia-powerd is not installed, so Dynamic Boost is"
+                             " unavailable and the GPU is capped at its base TGP.")
+                hint += ("\n\n  To cap the GPU lower rather than higher, clocks do work:"
+                         "\n    sudo aorusctl gpu clocks 210,1800")
+            raise Err(f"asked for {w:.0f} W but the GPU is still at {got:.0f} W.{hint}")
+
+        STATE.set_current("gpu_power_limit", w)
+        msg = f"GPU power limit -> {w:.0f} W (range {lo:.0f}-{hi:.0f} W)"
+        if got is None:
+            msg += "\n  Could not read the limit back, so this is unconfirmed."
+        if turned_on_persistence:
+            STATE.remember("gpu_persistence", 0)
+            msg += ("\n  Persistence mode was off, so the limit would have reverted as soon"
+                    " as the GPU went idle. It is on now."
+                    "\n  That keeps the dGPU initialised and costs battery on a laptop."
+                    " `sudo nvidia-smi -pm 0` turns it off again,"
+                    "\n  and so does `aorusctl reset`.")
+        return msg
+
+    def set_clocks(self, lo, hi):
+        if not self.smi:
+            raise Err("nvidia-smi not found")
+        need_root()
+        if DRY_RUN:
+            print(f"  [dry-run] nvidia-smi -lgc {int(lo)},{int(hi)}")
+            return "would lock clocks"
+        p = run([self.smi, "-lgc", f"{int(lo)},{int(hi)}"])
+        if p is None or p.returncode != 0:
+            msg = (p.stderr or p.stdout).strip() if p else "no output"
+            raise Err(f"nvidia-smi -lgc failed: {msg}")
+        STATE.set_current("gpu_clocks", [int(lo), int(hi)])
+        return f"GPU clocks locked to {int(lo)}-{int(hi)} MHz"
+
+    def unlock_clocks(self):
+        if not self.smi:
+            raise Err("nvidia-smi not found")
+        need_root()
+        if DRY_RUN:
+            print("  [dry-run] nvidia-smi -rgc")
+            return "would unlock clocks"
+        p = run([self.smi, "-rgc"])
+        if p is None or p.returncode != 0:
+            msg = (p.stderr or p.stdout).strip() if p else "no output"
+            raise Err(f"nvidia-smi -rgc failed: {msg}")
+        STATE.set_current("gpu_clocks", None)
+        return "GPU clocks unlocked"
+
+    def reset(self):
+        if not self.smi:
+            return []
+        need_root()
+        msgs = []
+        if DRY_RUN:
+            return ["  [dry-run] nvidia-smi -rgc ; nvidia-smi -pl <default>"]
+        p = run([self.smi, "-rgc"])
+        msgs.append("GPU clocks unlocked" if p and p.returncode == 0 else "GPU clock reset skipped")
+        default = STATE.original("gpu_power_limit")
+        if default is None:
+            q = self.query() or {}
+            default = q.get("power.default_limit")
+        if default:
+            p = run([self.smi, "-pl", f"{float(default):.0f}"])
+            if p and p.returncode == 0:
+                msgs.append(f"GPU power limit restored to {float(default):.0f} W")
+        return msgs
+
+
+# ----------------------------------------------------------------------------
+# snapshot
+# ----------------------------------------------------------------------------
+
+FANS = None
+CPU = None
+GPU = None
+
+
+def hw():
+    global FANS, CPU, GPU
+    if FANS is None:
+        FANS, CPU, GPU = Fans(), Cpu(), Gpu()
+    return FANS, CPU, GPU
+
+
+def daemon_active():
+    p = run(["systemctl", "is-active", "aorusctld"])
+    return bool(p and p.stdout.strip() == "active")
+
+
+def yield_daemon(reason="a fan mode was set by hand"):
+    """Stop aorusctld so an explicit choice sticks. Returns a note, or None.
+
+    Choosing a fan mode should hold until it is changed again, so anything that
+    sets one takes the fans off the daemon rather than quietly losing to it a
+    couple of seconds later.
+    """
+    if not daemon_active():
+        return None
+    if DRY_RUN:
+        return "  [dry-run] would stop aorusctld"
+    run(["systemctl", "stop", "aorusctld"])
+    time.sleep(0.4)
+    return f"stopped aorusctld ({reason}); `sudo systemctl start aorusctld` puts it back"
+
+
+def snapshot():
+    fans, cpu, gpu = hw()
+    ct = cpu.temps()
+    freqs = cpu.freqs_mhz()
+    ftemps = fans.temps()
+    g = gpu.query() if gpu.available else None
+    return {
+        "time": time.time(),
+        "fan": {
+            "available": fans.available,
+            "mode": fans.mode(),
+            "custom_speed_pct": fans.custom_speed_pct(),
+            "pwm_pct": fans.pwm_pct(),
+            "rpm": fans.rpms(),
+            "duty": fans.pwms(),
+            "ec_temps": ftemps,
+            "charge_limit": fans.charge_limit(),
+            "charge_mode": fans.charge_mode(),
+            "gpu_boost": fans.gpu_boost(),
+            "battery_cycle": fans.battery_cycle(),
+            "daemon": daemon_active(),
+        },
+        "cpu": {
+            "package_c": ct["package"] if ct["package"] is not None else ftemps.get("cpu"),
+            "cores_c": ct["cores"],
+            "power_w": cpu.package_power_w(),
+            "power_note": cpu.power_note,
+            "freq_mhz_avg": round(sum(freqs) / len(freqs)) if freqs else None,
+            "freq_mhz_max": round(max(freqs)) if freqs else None,
+            "freqs": freqs,
+            "governor": cpu.governor(),
+            "epp": cpu.epp(),
+            "max_perf_pct": cpu.max_perf_pct(),
+            "min_perf_pct": cpu.min_perf_pct(),
+            "turbo": cpu.turbo(),
+            "constraints": cpu.constraints(),
+            "platform_profile": cpu.platform_profile(),
+        },
+        "gpu": ({
+            "available": True,
+            "name": g.get("name"),
+            "temp_c": g.get("temperature.gpu"),
+            "util_pct": g.get("utilization.gpu"),
+            "mem_util_pct": g.get("utilization.memory"),
+            "power_w": g.get("power.draw"),
+            "power_limit_w": g.get("power.limit") or g.get("power.default_limit"),
+            "power_limit_reported": g.get("power.limit") is not None,
+            "power_default_w": g.get("power.default_limit"),
+            "power_min_w": g.get("power.min_limit"),
+            "power_max_w": g.get("power.max_limit"),
+            "clock_sm_mhz": g.get("clocks.sm"),
+            "clock_mem_mhz": g.get("clocks.mem"),
+            "mem_used_mb": g.get("memory.used"),
+            "mem_total_mb": g.get("memory.total"),
+            "fan_pct": g.get("fan.speed"),
+            "powerd": gpu.powerd_active(),
+            "powerd_state": gpu.powerd_state(),
+            "persistence": gpu.persistence_on(),
+        } if g else {"available": gpu.available, "name": None}),
+    }
+
+
+def fmt(v, unit="", nd=0):
+    if v is None:
+        return "  --"
+    if isinstance(v, float):
+        return f"{v:.{nd}f}{unit}"
+    return f"{v}{unit}"
+
+
+def cmd_status(args):
+    snapshot()          # prime the RAPL energy counter
+    time.sleep(0.35)
+    s = snapshot()      # second read, so package watts is a real average
+    if args.json:
+        print(json.dumps(s, indent=2, default=str))
+        return 0
+
+    f, c, g = s["fan"], s["cpu"], s["gpu"]
+    print(f"aorusctl {VERSION}   {rd('/sys/class/dmi/id/product_name', 'unknown laptop')}")
+    print()
+    print("CPU")
+    pw = fmt(c["power_w"], " W", 1)
+    if c["power_w"] is None and c.get("power_note"):
+        pw = f"--  ({c['power_note']})"
+    print(f"  package        {fmt(c['package_c'], ' C', 1):>12}   power {pw:>10}")
+    print(f"  freq           {fmt(c['freq_mhz_avg'], ' MHz'):>12}   peak  {fmt(c['freq_mhz_max'], ' MHz'):>10}")
+    print(f"  governor       {str(c['governor']):>12}   epp   {str(c['epp']):>10}")
+    print(f"  perf window    {fmt(c['min_perf_pct'], '%')}-{fmt(c['max_perf_pct'], '%')}"
+          f"        turbo {('on' if c['turbo'] else 'off') if c['turbo'] is not None else '--'}")
+    for k in c["constraints"]:
+        if not k["max_w"]:
+            cap = "max not published"
+        elif k["limit_w"] > k["max_w"]:
+            cap = f"max {k['max_w']:.0f} W, so this domain is not the binding one"
+        else:
+            cap = f"max {k['max_w']:.0f} W"
+        print(f"  rapl {k['domain']:<20} {k['name']:<12} {k['limit_w']:6.1f} W  ({cap})")
+    eff = [k["limit_w"] for k in c["constraints"]
+           if k["name"] == "long_term" and k["limit_w"] > 0]
+    if len(eff) > 1 and min(eff) != max(eff):
+        print(f"  effective PL1    {min(eff):.0f} W   (the lower of the MSR and MMIO limits wins)")
+    if c["platform_profile"]:
+        print(f"  platform profile  {c['platform_profile']}")
+    print()
+    print("GPU")
+    if g.get("name"):
+        print(f"  {g['name']}")
+        lim = fmt(g["power_limit_w"], " W", 0)
+        if not g.get("power_limit_reported") and g["power_limit_w"]:
+            lim += " (default; vBIOS does not report the enforced value)"
+        print(f"  temp           {fmt(g['temp_c'], ' C'):>12}   power {fmt(g['power_w'], ' W', 1):>10}"
+              f"  limit {lim}")
+        print(f"  util           {fmt(g['util_pct'], ' %'):>12}   sm    {fmt(g['clock_sm_mhz'], ' MHz'):>10}"
+              f"  mem {fmt(g['clock_mem_mhz'], ' MHz')}")
+        print(f"  vram           {fmt(g['mem_used_mb'], ' MB'):>12} / {fmt(g['mem_total_mb'], ' MB')}")
+        if g["power_min_w"]:
+            print(f"  limit range    {fmt(g['power_min_w'], '')}-{fmt(g['power_max_w'], ' W')}"
+                  f"  (default {fmt(g['power_default_w'], ' W')})")
+        st = g.get("powerd_state")
+        if st == "active":
+            print("  nvidia-powerd  running, so Dynamic Boost is managing the limit")
+        elif st == "disabled":
+            print(f"  nvidia-powerd  installed but not running, so Dynamic Boost is off and "
+                  f"the GPU is stuck at {fmt(g['power_default_w'], ' W')}")
+            print("                 sudo systemctl enable --now nvidia-powerd")
+        elif st == "absent":
+            print("  nvidia-powerd  not installed, so Dynamic Boost is unavailable")
+        if g.get("persistence") is False:
+            print("  persistence    off, so limits reset when the last GPU client exits")
+    else:
+        print("  nvidia-smi unavailable")
+    print()
+    print("FANS")
+    if f["available"]:
+        print(f"  mode           {str(f['mode']):>12}   duty  {fmt(f['pwm_pct'], ' %'):>10}"
+              f"  custom {fmt(f['custom_speed_pct'], ' %')}")
+        if f["rpm"]:
+            print("  rpm            " + "   ".join(f"{k}:{v}" for k, v in f["rpm"].items()))
+        if f["duty"]:
+            print("  per-fan duty   " + "   ".join(f"{k}:{v}%" for k, v in f["duty"].items()))
+        if f["ec_temps"]:
+            print("  ec temps       " + "   ".join(f"{k}:{v:.0f}C" for k, v in f["ec_temps"].items()))
+        extra = []
+        if f["charge_limit"]:
+            extra.append(f"charge limit {f['charge_limit']}% (mode {f['charge_mode']})")
+        if f["battery_cycle"]:
+            extra.append(f"battery cycles {f['battery_cycle']}")
+        if f["gpu_boost"] is not None:
+            extra.append(f"gpu_boost {f['gpu_boost']}")
+        if extra:
+            print("  " + "   ".join(extra))
+        if f.get("daemon"):
+            print("  aorusctld is running, so it owns the fans and will reassert fixed mode")
+            print("  within a couple of seconds of any change. `sudo systemctl stop "
+                  "aorusctld` to take over.")
+    else:
+        print("  unavailable: " + hw()[0].why_unavailable())
+    return 0
+
+
+# ----------------------------------------------------------------------------
+# curses dashboard
+# ----------------------------------------------------------------------------
+
+def cmd_mon(args):
+    import curses
+
+    hist = {"cpu_t": [], "gpu_t": [], "cpu_w": [], "gpu_w": [], "fan": []}
+    MAXH = 240
+
+    def push(k, v):
+        hist[k].append(v if v is not None else 0)
+        if len(hist[k]) > MAXH:
+            hist[k].pop(0)
+
+    BLOCKS = " ▁▂▃▄▅▆▇█"
+
+    def spark(vals, width, vmax=None):
+        if not vals:
+            return " " * width
+        v = vals[-width:]
+        top = vmax or max(max(v), 1)
+        return "".join(BLOCKS[clamp(int(x / top * 8), 0, 8)] for x in v).rjust(width)
+
+    def bar(win, y, x, w, frac, label, color):
+        frac = clamp(frac if frac is not None else 0, 0, 1)
+        filled = int(frac * w)
+        win.addstr(y, x, label)
+        win.addstr(y, x + 16, "[")
+        win.addstr(y, x + 17, "#" * filled, curses.color_pair(color) | curses.A_BOLD)
+        win.addstr(y, x + 17 + filled, "." * (w - filled))
+        win.addstr(y, x + 17 + w, "]")
+
+    def draw(stdscr):
+        curses.curs_set(0)
+        stdscr.nodelay(True)
+        curses.start_color()
+        curses.use_default_colors()
+        curses.init_pair(1, curses.COLOR_GREEN, -1)
+        curses.init_pair(2, curses.COLOR_YELLOW, -1)
+        curses.init_pair(3, curses.COLOR_RED, -1)
+        curses.init_pair(4, curses.COLOR_CYAN, -1)
+        curses.init_pair(5, curses.COLOR_MAGENTA, -1)
+
+        snapshot()  # prime the RAPL counter
+        model = rd("/sys/class/dmi/id/product_name", "laptop")
+
+        while True:
+            s = snapshot()
+            c, g, f = s["cpu"], s["gpu"], s["fan"]
+            push("cpu_t", c["package_c"]); push("gpu_t", g.get("temp_c"))
+            push("cpu_w", c["power_w"]); push("gpu_w", g.get("power_w"))
+            push("fan", (f["rpm"] or {}).get("cpu"))
+
+            stdscr.erase()
+            h, w = stdscr.getmaxyx()
+            sw = max(10, min(w - 34, 60))
+
+            def tcolor(t):
+                if t is None:
+                    return 1
+                return 3 if t >= 88 else (2 if t >= 75 else 1)
+
+            y = 0
+            stdscr.addstr(y, 0, f" aorusctl {VERSION}  {model} ", curses.A_REVERSE); y += 2
+
+            stdscr.addstr(y, 0, "CPU", curses.A_BOLD | curses.color_pair(4)); y += 1
+            stdscr.addstr(y, 2, f"temp {fmt(c['package_c'], ' C', 1):>8}", curses.color_pair(tcolor(c["package_c"])))
+            stdscr.addstr(y, 20, f"power {fmt(c['power_w'], ' W', 1):>8}")
+            stdscr.addstr(y, 38, f"freq {fmt(c['freq_mhz_avg'], ' MHz'):>9}")
+            stdscr.addstr(y, 58, f"gov {str(c['governor'])}"); y += 1
+            stdscr.addstr(y, 2, "temp  " + spark(hist["cpu_t"], sw, 105), curses.color_pair(tcolor(c["package_c"]))); y += 1
+            stdscr.addstr(y, 2, "power " + spark(hist["cpu_w"], sw)); y += 1
+            pl = {k["name"]: k for k in c["constraints"]}
+            lt, st = pl.get("long_term"), pl.get("short_term")
+            stdscr.addstr(y, 2, "PL1 " + (f"{lt['limit_w']:.0f} W" if lt else "--") +
+                                "   PL2 " + (f"{st['limit_w']:.0f} W" if st else "--") +
+                                f"   max_perf {fmt(c['max_perf_pct'], '%')}" +
+                                f"   turbo {('on' if c['turbo'] else 'off') if c['turbo'] is not None else '--'}")
+            y += 1
+            if lt and lt["max_w"]:
+                bar(stdscr, y, 2, 40, (c["power_w"] or 0) / max(lt["max_w"], 1), "  package load", tcolor(c["package_c"]))
+                y += 1
+            y += 1
+
+            stdscr.addstr(y, 0, "GPU", curses.A_BOLD | curses.color_pair(5)); y += 1
+            if g.get("name"):
+                stdscr.addstr(y, 2, f"temp {fmt(g['temp_c'], ' C'):>8}", curses.color_pair(tcolor(g["temp_c"])))
+                stdscr.addstr(y, 20, f"power {fmt(g['power_w'], ' W', 1):>8}")
+                stdscr.addstr(y, 38, f"sm   {fmt(g['clock_sm_mhz'], ' MHz'):>9}")
+                stdscr.addstr(y, 58, f"util {fmt(g['util_pct'], ' %')}"); y += 1
+                stdscr.addstr(y, 2, "temp  " + spark(hist["gpu_t"], sw, 100), curses.color_pair(tcolor(g["temp_c"]))); y += 1
+                stdscr.addstr(y, 2, "power " + spark(hist["gpu_w"], sw)); y += 1
+                lim = g.get("power_limit_w")
+                stdscr.addstr(y, 2, f"limit {fmt(lim, ' W')}   vram {fmt(g['mem_used_mb'], '')}/{fmt(g['mem_total_mb'], ' MB')}")
+                y += 1
+                if lim:
+                    bar(stdscr, y, 2, 40, (g["power_w"] or 0) / max(lim, 1), "  gpu load", tcolor(g["temp_c"]))
+                    y += 1
+            else:
+                stdscr.addstr(y, 2, "nvidia-smi unavailable"); y += 1
+            y += 1
+
+            stdscr.addstr(y, 0, "FANS", curses.A_BOLD | curses.color_pair(4)); y += 1
+            if f["available"]:
+                stdscr.addstr(y, 2, f"mode {str(f['mode']):>8}")
+                stdscr.addstr(y, 20, f"duty  {fmt(f['pwm_pct'], ' %'):>8}")
+                stdscr.addstr(y, 38, "rpm  " + "  ".join(f"{k}:{v}" for k, v in (f["rpm"] or {}).items()))
+                y += 1
+                stdscr.addstr(y, 2, "rpm   " + spark(hist["fan"], sw)); y += 1
+                for k, v in (f["duty"] or {}).items():
+                    bar(stdscr, y, 2, 40, v / 100, f"  {k} fan duty", 4); y += 1
+                if f["ec_temps"]:
+                    stdscr.addstr(y, 2, "ec temps  " + "  ".join(f"{k}:{v:.0f}C" for k, v in f["ec_temps"].items()))
+                    y += 1
+            else:
+                stdscr.addstr(y, 2, "fan driver unavailable"); y += 1
+
+            if y < h - 1:
+                stdscr.addstr(h - 1, 0, " q quit   n normal   s silent   g gaming   1-9 fixed duty 10-90%  ",
+                              curses.A_REVERSE)
+            stdscr.refresh()
+
+            t_end = time.time() + args.interval
+            while time.time() < t_end:
+                ch = stdscr.getch()
+                if ch == -1:
+                    time.sleep(0.05)
+                    continue
+                try:
+                    if ch in (ord("q"), 27):
+                        return
+                    if ch == ord("n"):
+                        FANS.set_mode("normal")
+                    elif ch == ord("s"):
+                        FANS.set_mode("silent")
+                    elif ch == ord("g"):
+                        FANS.set_mode("gaming")
+                    elif ord("1") <= ch <= ord("9"):
+                        FANS.set_speed_pct((ch - ord("0")) * 10)
+                        FANS.set_mode("fixed")
+                except Err:
+                    curses.flash()
+                break
+
+    if not is_root():
+        sys.stderr.write("note: running without root - the hotkeys that change fan mode will not work\n")
+        time.sleep(1)
+    curses.wrapper(draw)
+    return 0
+
+
+# ----------------------------------------------------------------------------
+# config / profiles
+# ----------------------------------------------------------------------------
+
+DEFAULT_CONFIG = {
+    "daemon": {
+        "enabled": True,
+        "interval": 2.0,
+        "hysteresis": 3.0,
+        "guard_temp": 92,
+        "guard_speed": 100,
+        "min_speed": 0,
+    },
+    "fans": {
+        "duty_max": 229,
+        "curve": [[0, 0], [45, 0], [55, 22], [65, 35], [72, 48], [80, 65], [86, 85], [92, 100]],
+    },
+    "profiles": {},
+}
+
+
+def apply_config_globals(cfg):
+    global FAN_DUTY_MAX
+    v = (cfg.get("fans") or {}).get("duty_max")
+    if isinstance(v, int) and 100 <= v <= 255:
+        FAN_DUTY_MAX = v
+
+
+def load_config():
+    cfg = json.loads(json.dumps(DEFAULT_CONFIG))
+    if CONFIG_FILE.exists():
+        try:
+            import tomllib
+            user = tomllib.loads(CONFIG_FILE.read_text())
+        except Exception as e:
+            raise Err(f"could not parse {CONFIG_FILE}: {e}")
+        for k, v in user.items():
+            if isinstance(v, dict) and isinstance(cfg.get(k), dict):
+                cfg[k].update(v)
+            else:
+                cfg[k] = v
+    return cfg
+
+
+def apply_profile(name, cfg=None):
+    cfg = cfg or load_config()
+    profs = cfg.get("profiles", {})
+    if name not in profs:
+        raise Err(f"no profile {name!r}; defined: {', '.join(sorted(profs)) or '(none)'}")
+    p = profs[name]
+    fans, cpu, gpu = hw()
+    applied, skipped = [], []
+
+    def attempt(label, fn):
+        try:
+            fn()
+            applied.append(label)
+        except Err as e:
+            # The full explanations are long by design. In a profile summary one
+            # line per skip is enough; run the command directly for the rest.
+            first = str(e).strip().splitlines()[0]
+            skipped.append(f"{label}: {first}")
+
+    if "platform_profile" in p:
+        attempt(f"platform_profile={p['platform_profile']}",
+                lambda: cpu.set_platform_profile(p["platform_profile"]))
+    if "cpu_pl1" in p:
+        attempt(f"PL1={p['cpu_pl1']}W", lambda: cpu.set_pl1(p["cpu_pl1"]))
+    if "cpu_pl2" in p:
+        attempt(f"PL2={p['cpu_pl2']}W", lambda: cpu.set_pl2(p["cpu_pl2"]))
+    if "max_perf_pct" in p:
+        attempt(f"max_perf={p['max_perf_pct']}%", lambda: cpu.set_max_perf_pct(p["max_perf_pct"]))
+    if "turbo" in p:
+        attempt(f"turbo={'on' if p['turbo'] else 'off'}", lambda: cpu.set_turbo(bool(p["turbo"])))
+    if "governor" in p:
+        attempt(f"governor={p['governor']}", lambda: cpu.set_governor(p["governor"]))
+    if "epp" in p:
+        attempt(f"epp={p['epp']}", lambda: cpu.set_epp(p["epp"]))
+    if "gpu_power_limit" in p:
+        attempt(f"gpu_pl={p['gpu_power_limit']}W", lambda: gpu.set_power_limit(p["gpu_power_limit"]))
+    if "gpu_clocks" in p:
+        v = p["gpu_clocks"]
+        if v in ("reset", "auto", []) :
+            attempt("gpu clocks unlocked", gpu.unlock_clocks)
+        else:
+            lo, hi = v
+            attempt(f"gpu_clocks={lo}-{hi}", lambda: gpu.set_clocks(lo, hi))
+    if "gpu_boost" in p:
+        attempt(f"gpu_boost={p['gpu_boost']}", lambda: fans.set_gpu_boost(p["gpu_boost"]))
+    if "fan_curve" in p:
+        attempt("fan curve", lambda: fans.set_curve([tuple(x) for x in p["fan_curve"]]))
+    if "fan_speed" in p:
+        attempt(f"fan speed={p['fan_speed']}%", lambda: fans.set_speed_pct(p["fan_speed"]))
+    if "fan_mode" in p:
+        attempt(f"fan mode={p['fan_mode']}", lambda: fans.set_mode(p["fan_mode"]))
+    if "charge_limit" in p:
+        attempt(f"charge limit={p['charge_limit']}%", lambda: fans.set_charge_limit(p["charge_limit"]))
+
+    STATE.set_current("profile", name)
+    return applied, skipped
+
+
+# ----------------------------------------------------------------------------
+# reset
+# ----------------------------------------------------------------------------
+
+def cmd_reset(args):
+    need_root()
+    fans, cpu, gpu = hw()
+    orig = STATE.data.get("original", {})
+    msgs = []
+
+    for key, val in list(orig.items()):
+        try:
+            if key.startswith("rapl|"):
+                _, dom, idx = key.split("|")
+                wr(POWERCAP / dom / f"constraint_{idx}_power_limit_uw", val)
+                msgs.append(f"{dom} constraint {idx} -> {val/1_000_000:.1f} W")
+            elif key == "max_perf_pct":
+                wr(PSTATE / "max_perf_pct", val); msgs.append(f"max_perf_pct -> {val}")
+            elif key == "no_turbo":
+                wr(PSTATE / "no_turbo", val); msgs.append(f"no_turbo -> {val}")
+            elif key == "governor":
+                cpu.set_governor(val); msgs.append(f"governor -> {val}")
+            elif key == "epp":
+                cpu.set_epp(val); msgs.append(f"epp -> {val}")
+            elif key == "platform_profile":
+                wr(PLATFORM_PROFILE, val); msgs.append(f"platform_profile -> {val}")
+            elif key == "fan_custom_speed_pct":
+                fans.set_speed_pct(val); msgs.append(f"fan custom speed -> {val}%")
+            elif key == "gpu_boost":
+                wr(AORUS / "gpu_boost", val); msgs.append(f"gpu_boost -> {val}")
+            elif key == "charge_mode":
+                wr(AORUS / "charge_mode", val); msgs.append(f"charge_mode -> {val}")
+            elif key == "charge_limit":
+                wr(AORUS / "charge_limit", val); msgs.append(f"charge_limit -> {val}")
+        except Err as e:
+            msgs.append(f"! {key}: {e}")
+
+    # fan mode last, so the fans are not left in a custom mode with a stale duty
+    if not fans.available:
+        pass
+    elif "fan_mode" in orig:
+        try:
+            fans.set_mode(orig["fan_mode"])
+            msgs.append(f"fan mode -> {orig['fan_mode']}")
+        except Err as e:
+            msgs.append(f"! fan mode: {e}")
+    elif fans.available:
+        try:
+            fans.set_mode("normal")
+            msgs.append("fan mode -> normal")
+        except Err:
+            pass
+
+    if gpu.available:
+        msgs += gpu.reset()
+        if STATE.original("gpu_persistence") == 0 and not DRY_RUN:
+            if run([gpu.smi, "-pm", "0"]):
+                msgs.append("GPU persistence mode -> off")
+
+    if not DRY_RUN:
+        STATE.data = {}
+        STATE.save()
+    print("Restored:")
+    for m in msgs:
+        print("  " + m)
+    if not msgs:
+        print("  nothing to undo - no recorded changes")
+    return 0
+
+
+# ----------------------------------------------------------------------------
+# daemon: software fan curve + thermal guard
+# ----------------------------------------------------------------------------
+
+_daemon_stop = threading.Event()
+
+
+def _restore_on_exit():
+    try:
+        fans = hw()[0]
+        if fans.available:
+            duty = STATE.original("fan_custom_speed_pct")
+            if duty is not None:
+                fans.set_speed_pct(duty)
+            target = STATE.original("fan_mode") or "normal"
+            fans.set_mode(target)
+            sys.stderr.write(f"[aorusctld] restored fan mode to {target}\n")
+    except Exception as e:
+        sys.stderr.write(f"[aorusctld] restore failed: {e}\n")
+
+
+def cmd_daemon_cleanup(args):
+    """ExecStopPost hook. Hands the fans back to the firmware unless the daemon
+    stood down on purpose, in which case the mode the user picked is left alone."""
+    if YIELD_FLAG.exists():
+        mode = rd(YIELD_FLAG, "").strip()
+        YIELD_FLAG.unlink(missing_ok=True)
+        print(f"aorusctld stood down; leaving fan mode at {mode or 'your choice'}")
+        return 0
+    fans = hw()[0]
+    if not fans.available:
+        return 0
+    target = STATE.original("fan_mode") or "normal"
+    try:
+        fans.set_mode(target)
+        print(f"fan mode -> {target}")
+    except Err as e:
+        sys.stderr.write(f"aorusctl: {e}\n")
+    return 0
+
+
+def cmd_daemon(args):
+    need_root()
+    cfg = load_config()
+    d = cfg["daemon"]
+    fans, cpu, gpu = hw()
+    if not fans.available:
+        raise Err("fan driver unavailable: " + fans.why_unavailable())
+
+    curve = sorted((float(t), float(s)) for t, s in d["curve"])
+    interval = float(d.get("interval", 2.0))
+    hyst = float(d.get("hysteresis", 3.0))
+    guard_t = float(d.get("guard_temp", 92))
+    guard_s = float(d.get("guard_speed", 100))
+    min_s = float(d.get("min_speed", 0))
+
+    def curve_speed(t):
+        if t <= curve[0][0]:
+            return curve[0][1]
+        if t >= curve[-1][0]:
+            return curve[-1][1]
+        for i in range(1, len(curve)):
+            t0, s0 = curve[i - 1]
+            t1, s1 = curve[i]
+            if t <= t1:
+                if t1 == t0:
+                    return s1
+                return s0 + (s1 - s0) * (t - t0) / (t1 - t0)
+        return curve[-1][1]
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(sig, lambda *_: _daemon_stop.set())
+        except ValueError:
+            pass   # not the main thread; the caller owns shutdown
+
+    STATE.remember("fan_mode", fans.mode() or "normal")
+    fans.set_mode("fixed")
+    applied = None
+    yielded = False
+    YIELD_FLAG.unlink(missing_ok=True)
+    peak = 0.0
+    sys.stderr.write(f"[aorusctld] curve {curve} interval {interval}s "
+                     f"guard {guard_t}C floor {min_s}%\n")
+
+    try:
+        snapshot()
+        while not _daemon_stop.is_set():
+            s = snapshot()
+            temps = [x for x in (s["cpu"]["package_c"], s["gpu"].get("temp_c"),
+                                 s["fan"]["ec_temps"].get("cpu"), s["fan"]["ec_temps"].get("gpu"))
+                     if x]
+            t = max(temps) if temps else 0.0
+            peak = max(peak, t)
+
+            want = guard_s if t >= guard_t else curve_speed(t)
+            # hysteresis: only ease off once the temperature has genuinely dropped
+            if applied is not None and want < applied:
+                if curve_speed(t + hyst) >= applied and t < guard_t:
+                    want = applied
+            want = int(round(clamp(want, min_s if t < guard_t else 0, 100)))
+
+            # Reassert every tick, not only when the target duty changes. The old
+            # behaviour let an external `fan mode normal` stand until the
+            # temperature happened to move, so the fans looked like they flipped
+            # back to fixed at random minutes later.
+            mode_now = fans.mode()
+            if mode_now != "fixed":
+                # Somebody picked a mode. That is an explicit instruction, so the
+                # daemon steps aside instead of overwriting it two seconds later.
+                sys.stderr.write(f"[aorusctld] fan mode was set to {mode_now} outside "
+                                 f"the daemon, so the daemon is standing down and "
+                                 f"leaving the fans alone.\n")
+                yielded = True
+                try:
+                    YIELD_FLAG.write_text(mode_now)
+                except OSError:
+                    pass
+                break
+
+            if want != applied:
+                try:
+                    fans.set_speed_pct(want)
+                    if fans.mode() != "fixed":
+                        fans.set_mode("fixed")
+                    applied = want
+                    log(f"{t:.0f}C -> fan {want}%")
+                except Err as e:
+                    sys.stderr.write(f"[aorusctld] {e}\n")
+
+            _daemon_stop.wait(interval)
+    finally:
+        if not yielded:
+            _restore_on_exit()
+        else:
+            sys.stderr.write("[aorusctld] leaving the fans as you set them.\n")
+    return 0
+
+
+# ----------------------------------------------------------------------------
+# web dashboard
+# ----------------------------------------------------------------------------
+
+WEB_PAGE = r"""<!doctype html><html><head><meta charset="utf-8">
+<title>aorusctl</title><meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+:root{
+  color-scheme: light dark;
+  --bg:#f6f5f2; --panel:#fbfaf8; --ink:#1b1b19; --dim:#77756e; --rule:#dcd9d1;
+  --grid:#e7e4dc; --accent:#b4551a; --ok:#4e7a45; --warn:#96741a; --hot:#a8412f;
+  --mono: ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,"DejaVu Sans Mono",monospace;
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --bg:#101011; --panel:#161617; --ink:#e6e4de; --dim:#8b887f; --rule:#2a2a2b;
+    --grid:#212122; --accent:#d5813f; --ok:#7d9e6f; --warn:#c0a03c; --hot:#c9604c;
+  }
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:13px/1.5 var(--mono);
+  -webkit-font-smoothing:antialiased}
+header{display:flex;align-items:baseline;gap:16px;flex-wrap:wrap;
+  padding:12px 18px;border-bottom:1px solid var(--rule)}
+.brand{font-weight:600;letter-spacing:.02em}
+.brand::before{content:"";display:inline-block;width:7px;height:7px;margin-right:8px;
+  background:var(--accent);vertical-align:middle}
+#model{color:var(--dim)}
+#stamp{margin-left:auto;color:var(--dim);font-size:12px}
+
+main{display:grid;gap:1px;background:var(--rule);
+  grid-template-columns:repeat(auto-fit,minmax(340px,1fr));
+  border-bottom:1px solid var(--rule)}
+.panel{background:var(--panel);padding:16px 18px 18px}
+.panel h2{margin:0 0 14px;font-size:12px;font-weight:600;color:var(--dim);
+  letter-spacing:.02em}
+
+.readout{display:flex;gap:14px;flex-wrap:wrap;align-items:flex-end}
+.readout div{min-width:52px}
+.readout b{display:block;font-size:21px;font-weight:500;font-variant-numeric:tabular-nums;
+  letter-spacing:-.02em;line-height:1.15}
+.readout span{font-size:11px;color:var(--dim)}
+
+canvas{width:100%;height:56px;display:block;margin:14px 0 12px}
+
+table{width:100%;border-collapse:collapse;font-size:12px}
+tr+tr td{border-top:1px dotted var(--grid)}
+td{padding:4px 0;color:var(--dim);white-space:nowrap}
+td:last-child{text-align:right;color:var(--ink);font-variant-numeric:tabular-nums;
+  width:99%;white-space:normal}
+
+.ctl{margin-top:14px;padding-top:12px;border-top:1px solid var(--rule)}
+.row{display:flex;align-items:center;gap:10px;margin-top:8px}
+.row label{font-size:11px;color:var(--dim);min-width:66px}
+.row output{font-variant-numeric:tabular-nums;min-width:50px;text-align:right;font-size:12px}
+input[type=range]{flex:1;accent-color:var(--accent);height:16px}
+
+button{font:inherit;font-size:12px;background:none;color:var(--dim);
+  border:1px solid var(--rule);border-radius:0;padding:4px 9px;margin:4px 4px 0 0;
+  cursor:pointer;transition:color .12s,border-color .12s}
+button:hover{color:var(--ink);border-color:var(--dim)}
+button.on{color:var(--accent);border-color:var(--accent)}
+button.on::before{content:"> "}
+
+.note{font-size:11px;color:var(--warn);margin:8px 0 0;white-space:normal;line-height:1.45}
+#msg{padding:12px 18px;color:var(--dim);font-size:12px;min-height:16px;
+  white-space:pre-wrap;line-height:1.55;border-bottom:1px solid transparent}
+#msg.ok{color:var(--ok);border-color:var(--rule)}
+#msg.hot{color:var(--hot);border-color:var(--rule)}
+.ro{opacity:.4;pointer-events:none}
+</style></head><body>
+<header>
+  <span class="brand">aorusctl</span><span id="model"></span><span id="stamp">connecting</span>
+</header>
+<main>
+<section class="panel"><h2>cpu</h2>
+ <div class="readout">
+  <div><b id="ct">--</b><span>temp &deg;C</span></div>
+  <div><b id="cw">--</b><span>watts</span></div>
+  <div><b id="cf">--</b><span>MHz</span></div>
+ </div>
+ <canvas id="cct" data-max="100" data-min="30"></canvas>
+ <table id="ctab"></table>
+ <div class="ctl" data-ctl>
+  <div class="row"><label>pl1</label><input type="range" id="pl1" min="10" max="120" step="1"><output id="pl1o"></output></div>
+  <div class="row"><label>pl2</label><input type="range" id="pl2" min="10" max="180" step="1"><output id="pl2o"></output></div>
+  <div class="row"><label>max perf</label><input type="range" id="mpp" min="20" max="100" step="1"><output id="mppo"></output></div>
+  <div><button data-act="turbo" data-v="1">turbo on</button><button data-act="turbo" data-v="0">turbo off</button></div>
+ </div>
+</section>
+
+<section class="panel"><h2>gpu</h2>
+ <div class="readout">
+  <div><b id="gt">--</b><span>temp &deg;C</span></div>
+  <div><b id="gw">--</b><span>watts</span></div>
+  <div><b id="gc">--</b><span>sm MHz</span></div>
+  <div><b id="gu">--</b><span>util %</span></div>
+ </div>
+ <canvas id="cgt" data-max="95" data-min="30"></canvas>
+ <table id="gtab"></table>
+ <div class="ctl" data-ctl>
+  <div class="row"><label>power cap</label><input type="range" id="gpl" min="20" max="150" step="1"><output id="gplo"></output></div>
+  <p id="gplwarn" class="note"></p>
+  <div>
+   <button data-act="gpu_boost" data-v="0">boost off</button>
+   <button data-act="gpu_boost" data-v="1">boost on</button>
+   <button data-act="gpu_boost" data-v="2">boost max</button>
+   <button data-act="gpu_reset">reset</button>
+  </div>
+ </div>
+</section>
+
+<section class="panel"><h2>fans</h2>
+ <div class="readout">
+  <div><b id="fm">--</b><span>mode</span></div>
+  <div><b id="fd">--</b><span>duty %</span></div>
+  <div><b id="fr">--</b><span>cpu rpm</span></div>
+  <div><b id="fr2">--</b><span>gpu rpm</span></div>
+ </div>
+ <canvas id="cfr"></canvas>
+ <table id="ftab"></table>
+ <div class="ctl" data-ctl>
+  <div id="modes"></div>
+  <p id="fanwarn" class="note"></p>
+  <div class="row"><label>fixed duty</label><input type="range" id="fspd" min="0" max="100" step="5"><output id="fspdo"></output></div>
+ </div>
+</section>
+
+<section class="panel"><h2>profiles</h2>
+ <div data-ctl id="profs"></div>
+ <table><tr><td>defined in</td><td>/etc/aorusctl/config.toml</td></tr></table>
+ <div class="ctl" data-ctl><button data-act="reset">revert everything</button></div>
+</section>
+</main>
+<div id="msg"></div>
+<script>
+
+const H={cct:[],cgt:[],cfr:[]}, MAX=180;
+let RO=false;
+function push(k,v){H[k].push(v==null?0:v); if(H[k].length>MAX)H[k].shift();}
+const CSS=getComputedStyle(document.documentElement);
+const V=n=>CSS.getPropertyValue(n).trim();
+let P={};
+function pal(){P={dim:V('--dim'),ok:V('--ok'),warn:V('--warn'),hot:V('--hot'),accent:V('--accent')};}
+pal();
+function col(t){return t==null?P.dim:t>=88?P.hot:t>=75?P.warn:P.ok;}
+function hexa(c,a){const s=c.replace('#','');
+ const r=parseInt(s.slice(0,2),16),g=parseInt(s.slice(2,4),16),b=parseInt(s.slice(4,6),16);
+ return `rgba(${r},${g},${b},${a})`;}
+function draw(id,color){
+ const c=document.getElementById(id),d=H[id];
+ const r=window.devicePixelRatio||1,w=c.clientWidth,h=c.clientHeight;
+ c.width=w*r;c.height=h*r;const x=c.getContext('2d');x.scale(r,r);x.clearRect(0,0,w,h);
+ if(!d.length)return;
+ const lo=+c.dataset.min||0, top=Math.max(+c.dataset.max||0,...d,lo+1);
+ const n=Math.max(d.length-1,1), X=i=>i/n*w,
+       Y=v=>h-Math.max(0,Math.min(1,(v-lo)/(top-lo)))*(h-4)-2;
+ x.strokeStyle=V('--grid');x.lineWidth=1;
+ x.beginPath();x.moveTo(0,h-0.5);x.lineTo(w,h-0.5);x.stroke();
+ x.beginPath();x.moveTo(X(0),h);
+ d.forEach((v,i)=>x.lineTo(X(i),Y(v)));
+ x.lineTo(X(d.length-1),h);x.closePath();
+ const g=x.createLinearGradient(0,0,0,h);g.addColorStop(0,hexa(color,0.16));g.addColorStop(1,hexa(color,0));
+ x.fillStyle=g;x.fill();
+ x.beginPath();d.forEach((v,i)=>{i?x.lineTo(X(i),Y(v)):x.moveTo(X(i),Y(v))});
+ x.strokeStyle=color;x.lineWidth=1.6;x.lineJoin='round';x.stroke();
+ x.fillStyle=color;x.beginPath();x.arc(X(d.length-1),Y(d.at(-1)),2.4,0,7);x.fill();
+}
+const f=(v,n=0,u='')=>v==null?'--':(+v).toFixed(n)+u;
+function tab(id,rows){document.getElementById(id).innerHTML=
+ rows.filter(r=>r[1]!=null&&r[1]!=='').map(r=>`<tr><td>${r[0]}</td><td>${r[1]}</td></tr>`).join('');}
+async function act(body){
+ const m=document.getElementById('msg'); m.textContent='working…';
+ const r=await fetch('/api/action',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
+ const j=await r.json(); m.textContent=j.message||''; m.className=j.ok?'ok':'hot'; tick();
+ clearTimeout(window._msgT);
+ if(j.ok)window._msgT=setTimeout(()=>{m.textContent='';m.className='';},8000);
+}
+document.addEventListener('click',e=>{const b=e.target.closest('button[data-act]');if(b)act({action:b.dataset.act,value:b.dataset.v})});
+const slid=(id,out,fn,unit)=>{const el=document.getElementById(id),o=document.getElementById(out);
+ el.addEventListener('input',()=>o.textContent=el.value+unit);
+ el.addEventListener('change',()=>fn(el.value));};
+let touched={};
+['pl1','pl2','mpp','gpl','fspd'].forEach(id=>{const e=document.getElementById(id);
+ if(e){e.addEventListener('pointerdown',()=>touched[id]=Date.now());}});
+const fresh=id=>!(touched[id]&&Date.now()-touched[id]<6000);
+async function tick(){
+ let s; try{s=await(await fetch('/api/status')).json();}catch(e){document.getElementById('stamp').textContent='disconnected';return;}
+ RO=!s.root; document.querySelectorAll('[data-ctl]').forEach(e=>e.classList.toggle('ro',RO));
+ document.getElementById('model').textContent=s.model||'';
+ document.getElementById('stamp').textContent=(RO?'read-only, start with sudo to control  ':'')+new Date().toLocaleTimeString();
+ const c=s.cpu,g=s.gpu,fa=s.fan;
+ document.getElementById('ct').textContent=f(c.package_c,1);
+ document.getElementById('ct').style.color=col(c.package_c);
+ document.getElementById('cw').textContent=f(c.power_w,1);
+ document.getElementById('cf').textContent=f(c.freq_mhz_avg);
+ push('cct',c.package_c); draw('cct',col(c.package_c));
+ const pl={}; (c.constraints||[]).forEach(k=>pl[k.name]=k);
+ tab('ctab',[['governor',c.governor],['epp',c.epp],
+  ['PL1 / PL2',(pl.long_term?f(pl.long_term.limit_w,0,' W'):'--')+' / '+(pl.short_term?f(pl.short_term.limit_w,0,' W'):'--')],
+  ['perf window',f(c.min_perf_pct)+' to '+f(c.max_perf_pct)+' %'],
+  ['turbo',c.turbo==null?null:(c.turbo?'on':'off')],['platform profile',c.platform_profile],
+  ['peak core',c.freq_mhz_max?f(c.freq_mhz_max,0,' MHz'):null]]);
+ if(pl.long_term&&fresh('pl1')){const e=document.getElementById('pl1');
+  e.max=Math.max(20,Math.round(pl.long_term.max_w||120));e.value=Math.round(pl.long_term.limit_w);
+  document.getElementById('pl1o').textContent=e.value+' W';}
+ if(pl.short_term&&fresh('pl2')){const e=document.getElementById('pl2');
+  e.max=Math.max(20,Math.round(pl.short_term.max_w||180));e.value=Math.round(pl.short_term.limit_w);
+  document.getElementById('pl2o').textContent=e.value+' W';}
+ if(c.max_perf_pct!=null&&fresh('mpp')){document.getElementById('mpp').value=c.max_perf_pct;
+  document.getElementById('mppo').textContent=c.max_perf_pct+' %';}
+
+ document.getElementById('gt').textContent=f(g.temp_c);
+ document.getElementById('gt').style.color=col(g.temp_c);
+ document.getElementById('gw').textContent=f(g.power_w,1);
+ document.getElementById('gc').textContent=f(g.clock_sm_mhz);
+ document.getElementById('gu').textContent=f(g.util_pct);
+ push('cgt',g.temp_c); draw('cgt',col(g.temp_c));
+ tab('gtab',[['gpu',g.name],['power limit',g.power_limit_w?f(g.power_limit_w,0,' W'):null],
+  ['limit range',g.power_min_w?f(g.power_min_w,0)+' to '+f(g.power_max_w,0,' W'):null],
+  ['vram',g.mem_total_mb?f(g.mem_used_mb,0)+' / '+f(g.mem_total_mb,0,' MB'):null],
+  ['mem clock',g.clock_mem_mhz?f(g.clock_mem_mhz,0,' MHz'):null],
+  ['ec gpu boost',s.fan.gpu_boost],
+  ['nvidia-powerd',g.powerd_state==='active'?'running':
+    g.powerd_state==='disabled'?'installed but off, so no Dynamic Boost':
+    g.powerd_state==='absent'?'not installed':null],
+  ['persistence',g.persistence===false?'off':null]]);
+ if(g.power_limit_w&&fresh('gpl')){const e=document.getElementById('gpl');
+  e.min=Math.round(g.power_min_w||20);e.max=Math.round(g.power_max_w||150);
+  e.value=Math.round(g.power_limit_w);document.getElementById('gplo').textContent=e.value+' W';}
+ const gw=document.getElementById('gplwarn');
+ if(gw)gw.textContent=g.powerd_state==='disabled'
+   ?'Laptop vBIOSes ignore this. Enable nvidia-powerd for Dynamic Boost instead.'
+   :g.powerd?'nvidia-powerd rewrites this continuously.':'';
+
+ document.getElementById('fm').textContent=fa.mode||'--';
+ document.getElementById('fd').textContent=f(fa.pwm_pct);
+ document.getElementById('fr').textContent=f((fa.rpm||{}).cpu);
+ document.getElementById('fr2').textContent=f((fa.rpm||{}).gpu);
+ push('cfr',(fa.rpm||{}).cpu); draw('cfr',P.accent);
+ tab('ftab',[['custom duty',fa.custom_speed_pct!=null?fa.custom_speed_pct+' %':null],
+  ['ec cpu temp',fa.ec_temps&&fa.ec_temps.cpu?f(fa.ec_temps.cpu,0,' °C'):null],
+  ['ec gpu temp',fa.ec_temps&&fa.ec_temps.gpu?f(fa.ec_temps.gpu,0,' °C'):null],
+  ['managed by',fa.daemon?'aorusctld (it reasserts fixed mode)':null],
+  ['charge limit',fa.charge_limit?fa.charge_limit+' %':null],
+  ['battery cycles',fa.battery_cycle||null],
+  ['driver',fa.available?'aorus-laptop':'unavailable']]);
+ if(!document.getElementById('modes').dataset.done){
+  document.getElementById('modes').innerHTML=(s.fan_modes||[]).map(m=>
+   `<button data-act="fan_mode" data-v="${m}">${m}</button>`).join('');
+  document.getElementById('modes').dataset.done=1;}
+ document.querySelectorAll('#modes button').forEach(b=>b.classList.toggle('on',b.dataset.v===fa.mode));
+ const fw=document.getElementById('fanwarn');
+ if(fw)fw.textContent=fa.daemon
+   ?'aorusctld is running and will reassert fixed mode within a couple of seconds. Stop it to control the fans here.'
+   :'';
+ if(fa.custom_speed_pct!=null&&fresh('fspd')){document.getElementById('fspd').value=fa.custom_speed_pct;
+  document.getElementById('fspdo').textContent=fa.custom_speed_pct+' %';}
+ if(!document.getElementById('profs').dataset.done){
+  document.getElementById('profs').innerHTML=(s.profiles||[]).map(p=>
+   `<button data-act="profile" data-v="${p}">${p}</button>`).join('')||'<span style="color:var(--dim);font-size:12px">no profiles defined</span>';
+  document.getElementById('profs').dataset.done=1;}
+ document.querySelectorAll('#profs button').forEach(b=>b.classList.toggle('on',b.dataset.v===s.active_profile));
+}
+slid('pl1','pl1o',v=>act({action:'pl1',value:v}),' W');
+slid('pl2','pl2o',v=>act({action:'pl2',value:v}),' W');
+slid('mpp','mppo',v=>act({action:'max_perf_pct',value:v}),' %');
+slid('gpl','gplo',v=>act({action:'gpu_power_limit',value:v}),' W');
+slid('fspd','fspdo',v=>act({action:'fan_speed',value:v}),' %');
+tick(); setInterval(tick,2000);
+matchMedia('(prefers-color-scheme: dark)').addEventListener('change',()=>{pal();redraw();});
+function redraw(){draw('cct',col(H.cct.at(-1)));draw('cgt',col(H.cgt.at(-1)));draw('cfr',P.accent);}
+window.addEventListener('resize',redraw);
+</script></body></html>"""
+
+
+def cmd_web(args):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    cfg = load_config()
+    model = rd("/sys/class/dmi/id/product_name", "laptop")
+    snapshot()
+
+    class H(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *a):
+            if VERBOSE:
+                BaseHTTPRequestHandler.log_message(self, *a)
+
+        def _send(self, code, body, ctype):
+            if isinstance(body, str):
+                body = body.encode()
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _local_only(self):
+            host = self.client_address[0]
+            if host not in ("127.0.0.1", "::1", "localhost"):
+                self._send(403, '{"ok":false,"message":"controls are localhost-only"}',
+                           "application/json")
+                return False
+            return True
+
+        def do_GET(self):
+            if self.path.startswith("/api/status"):
+                s = snapshot()
+                s["model"] = model
+                s["root"] = is_root()
+                s["fan_modes"] = FAN_MODES
+                s["profiles"] = sorted(cfg.get("profiles", {}))
+                s["active_profile"] = STATE.current("profile")
+                self._send(200, json.dumps(s, default=str), "application/json")
+            elif self.path in ("/", "/index.html"):
+                self._send(200, WEB_PAGE, "text/html; charset=utf-8")
+            else:
+                self._send(404, "not found", "text/plain")
+
+        def do_POST(self):
+            if not self.path.startswith("/api/action"):
+                return self._send(404, "not found", "text/plain")
+            if not self._local_only():
+                return
+            n = int(self.headers.get("Content-Length") or 0)
+            try:
+                req = json.loads(self.rfile.read(n) or b"{}")
+            except Exception:
+                return self._send(400, '{"ok":false,"message":"bad json"}', "application/json")
+            ok, msg = True, ""
+            a, v = req.get("action"), req.get("value")
+            fans, cpu, gpu = hw()
+            try:
+                if not is_root():
+                    raise Err("started without root - restart with sudo to change anything")
+                if a == "fan_mode":
+                    note = yield_daemon("a fan mode was picked in the dashboard")
+                    fans.set_mode(v)
+                    msg = f"fan mode {v}" + (f"  ({note})" if note else "")
+                elif a == "fan_speed":
+                    note = yield_daemon("a fixed duty was set in the dashboard")
+                    fans.set_speed_pct(v)
+                    if fans.mode() not in ("fixed", "auto"):
+                        fans.set_mode("fixed")
+                    msg = f"fan fixed at {v}%" + (f"  ({note})" if note else "")
+                elif a == "pl1":
+                    msg = "; ".join(cpu.set_pl1(float(v)))
+                elif a == "pl2":
+                    msg = "; ".join(cpu.set_pl2(float(v)))
+                elif a == "max_perf_pct":
+                    cpu.set_max_perf_pct(int(v)); msg = f"max_perf_pct {v}"
+                elif a == "turbo":
+                    cpu.set_turbo(str(v) == "1"); msg = f"turbo {'on' if str(v) == '1' else 'off'}"
+                elif a == "gpu_power_limit":
+                    msg = gpu.set_power_limit(float(v))
+                elif a == "gpu_boost":
+                    fans.set_gpu_boost(int(v)); msg = f"EC gpu_boost {v}"
+                elif a == "gpu_reset":
+                    msg = "; ".join(gpu.reset()) or "nothing to reset"
+                elif a == "profile":
+                    applied, skipped = apply_profile(v, cfg)
+                    msg = f"profile {v}: " + (", ".join(applied) or "nothing applied")
+                    if skipped:
+                        msg += "  |  skipped: " + "; ".join(skipped)
+                elif a == "reset":
+                    import contextlib as _c, io as _io
+
+                    class _A:
+                        pass
+                    _b = _io.StringIO()
+                    with _c.redirect_stdout(_b):
+                        cmd_reset(_A())
+                    msg = "reverted: " + "; ".join(
+                        x.strip() for x in _b.getvalue().splitlines()[1:] if x.strip())
+                else:
+                    raise Err(f"unknown action {a!r}")
+            except Err as e:
+                ok, msg = False, str(e)
+            except Exception as e:
+                ok, msg = False, f"{type(e).__name__}: {e}"
+            self._send(200, json.dumps({"ok": ok, "message": msg}), "application/json")
+
+    srv = ThreadingHTTPServer((args.bind, args.port), H)
+    print(f"aorusctl dashboard on http://{args.bind}:{args.port}"
+          + ("" if is_root() else "   (read-only: not running as root)"))
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        srv.server_close()
+    return 0
+
+
+# ----------------------------------------------------------------------------
+# remaining subcommands
+# ----------------------------------------------------------------------------
+
+def cmd_fan(args):
+    fans = hw()[0]
+    if args.fan_cmd == "show":
+        if not fans.available:
+            print("fan driver unavailable: " + fans.why_unavailable())
+            return 1
+        print(f"mode          {fans.mode()}")
+        print(f"custom duty   {fmt(fans.custom_speed_pct(), ' %')}   "
+              f"(100% = EC value {FAN_DUTY_MAX})")
+        print(f"current duty  {fmt(fans.pwm_pct(), ' %')}")
+        print(f"rpm           " + ("  ".join(f"{k}:{v}" for k, v in fans.rpms().items()) or "--"))
+        pts = fans.curve()
+        if pts:
+            print("firmware curve (temp C -> duty)")
+            for i, (t, s) in enumerate(pts):
+                print(f"  [{i:2}]  {t:3} C  ->  {s:3} %")
+        return 0
+    need_root()
+    if not fans.available:
+        raise Err(fans.why_unavailable())
+    note = yield_daemon(f"you ran `fan {args.fan_cmd}`")
+    if note:
+        print(note)
+    if args.fan_cmd == "mode":
+        fans.set_mode(args.value)
+        print(f"fan mode -> {args.value}")
+    elif args.fan_cmd == "speed":
+        pct = int(args.value)
+        fans.set_speed_pct(pct)
+        if fans.mode() not in ("fixed", "auto"):
+            fans.set_mode("fixed")
+        print(f"fans fixed at {pct}%  (mode {fans.mode()})")
+    elif args.fan_cmd == "curve":
+        pts = []
+        for chunk in args.value.split(","):
+            t, s = chunk.split(":")
+            pts.append((int(t), int(s)))
+        fans.set_curve(pts)
+        fans.set_mode("custom")
+        print(f"wrote {len(pts)} curve points and switched to custom mode")
+    elif args.fan_cmd == "auto":
+        fans.set_mode("normal")
+        print("fan mode -> normal (firmware control)")
+    elif args.fan_cmd == "charge-limit":
+        fans.set_charge_limit(int(args.value))
+        print(f"charge limit -> {args.value}%")
+    return 0
+
+
+def cmd_cpu(args):
+    cpu = hw()[1]
+    if args.cpu_cmd == "show":
+        for k in cpu.constraints():
+            cap = f"max {k['max_w']:6.1f} W" if k["max_w"] else "max not published"
+            print(f"{k['domain']:<22} {k['name']:<12} {k['limit_w']:6.1f} W   {cap:<20}"
+                  f"   window {k['window_us']} us")
+        print(f"governor      {cpu.governor()}   available: {', '.join(cpu.governors())}")
+        print(f"epp           {cpu.epp()}   available: {', '.join(cpu.epps())}")
+        print(f"perf window   {cpu.min_perf_pct()}-{cpu.max_perf_pct()} %")
+        t = cpu.turbo()
+        print(f"turbo         {('on' if t else 'off') if t is not None else 'unknown'}")
+        pp = cpu.platform_profile()
+        if pp:
+            print(f"platform      {pp}   available: {', '.join(cpu.platform_profiles())}")
+        return 0
+    need_root()
+    if args.cpu_cmd == "pl1":
+        for m in cpu.set_pl1(float(args.value)):
+            print(m)
+    elif args.cpu_cmd == "pl2":
+        for m in cpu.set_pl2(float(args.value)):
+            print(m)
+    elif args.cpu_cmd == "maxpct":
+        cpu.set_max_perf_pct(int(args.value)); print(f"max_perf_pct -> {args.value}")
+    elif args.cpu_cmd == "turbo":
+        on = args.value.lower() in ("on", "1", "true", "yes")
+        cpu.set_turbo(on); print(f"turbo -> {'on' if on else 'off'}")
+    elif args.cpu_cmd == "governor":
+        n = cpu.set_governor(args.value); print(f"governor -> {args.value} on {n} cpus")
+    elif args.cpu_cmd == "epp":
+        n = cpu.set_epp(args.value); print(f"epp -> {args.value} on {n} cpus")
+    elif args.cpu_cmd == "platform":
+        cpu.set_platform_profile(args.value); print(f"platform profile -> {args.value}")
+    return 0
+
+
+def cmd_gpu(args):
+    gpu = hw()[2]
+    if args.gpu_cmd == "show":
+        q = gpu.query()
+        if not q:
+            raise Err("nvidia-smi returned nothing (is the dGPU powered / driver loaded?)")
+        for k, v in q.items():
+            print(f"{k:<24} {v}")
+        print(f"{'enforced limit (read back)':<24} {gpu.enforced_limit_w()}")
+        print(f"{'persistence mode':<24} {'on' if gpu.persistence_on() else 'off'}")
+        print(f"{'nvidia-powerd':<24} {gpu.powerd_state()}")
+        d = gpu.power_detail()
+        if d:
+            print("\nnvidia-smi -q -d POWER:")
+            for k, v in d.items():
+                print(f"  {k:<32} {v}")
+        return 0
+    need_root()
+    if args.gpu_cmd == "limit":
+        print(gpu.set_power_limit(float(args.value)))
+    elif args.gpu_cmd == "clocks":
+        lo, hi = (args.value.split(",") + [args.value])[:2]
+        print(gpu.set_clocks(int(lo), int(hi)))
+    elif args.gpu_cmd == "reset":
+        for m in gpu.reset():
+            print(m)
+    elif args.gpu_cmd == "boost":
+        hw()[0].set_gpu_boost(int(args.value)); print(f"ec gpu_boost -> {args.value}")
+    return 0
+
+
+def cmd_profile(args):
+    cfg = load_config()
+    if args.profile_cmd == "list":
+        profs = cfg.get("profiles", {})
+        if not profs:
+            print(f"no profiles defined in {CONFIG_FILE}")
+            return 0
+        active = STATE.current("profile")
+        for name in sorted(profs):
+            print(("* " if name == active else "  ") + name)
+        return 0
+    if args.profile_cmd == "show":
+        profs = cfg.get("profiles", {})
+        if args.name not in profs:
+            raise Err(f"no profile {args.name!r}; defined: {', '.join(sorted(profs)) or '(none)'}")
+        print(f"[profiles.{args.name}]")
+        for k, v in profs[args.name].items():
+            print(f"  {k:<18} {json.dumps(v)}")
+        return 0
+    need_root()
+    applied, skipped = apply_profile(args.name, cfg)
+    print(f"profile {args.name}")
+    for a in applied:
+        print("  ok      " + a)
+    for s in skipped:
+        print("  skipped " + s)
+    if not applied:
+        print("  nothing was applied")
+    return 0
+
+
+def cmd_probe(args):
+    here = Path(__file__).resolve().parent
+    script = here / "probe.sh"
+    if not script.exists():
+        raise Err(f"probe.sh not found next to {__file__}")
+    out = args.output or str(Path.cwd() / "aorus-probe-report.txt")
+    p = subprocess.run(["bash", str(script), out])
+    return p.returncode
+
+
+def cmd_version(args):
+    print(f"aorusctl {VERSION}")
+    fans, cpu, gpu = hw()
+    print(f"  fan driver     {'aorus-laptop' if fans.available else 'unavailable'}")
+    print(f"  rapl domains   {', '.join(d.name for d in cpu.rapl_domains) or 'none'}")
+    print(f"  intel_pstate   {rd(PSTATE / 'status', 'absent')}")
+    print(f"  nvidia-smi     {gpu.smi or 'absent'}")
+    print(f"  config         {CONFIG_FILE} {'(present)' if CONFIG_FILE.exists() else '(using defaults)'}")
+    return 0
+
+
+# ----------------------------------------------------------------------------
+# cli
+# ----------------------------------------------------------------------------
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="aorusctl",
+        description="Fan, CPU and GPU control plus dashboards for Gigabyte AORUS laptops.",
+        epilog="Everything is reversible: `sudo aorusctl reset` puts back every value it changed.")
+    p.add_argument("--dry-run", action="store_true", help="print writes instead of performing them")
+    p.add_argument("-v", "--verbose", action="store_true")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("status", help="one-shot snapshot")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_status)
+
+    s = sub.add_parser("mon", help="live terminal dashboard")
+    s.add_argument("-i", "--interval", type=float, default=1.0)
+    s.set_defaults(func=cmd_mon)
+
+    s = sub.add_parser("web", help="live dashboard in a browser")
+    s.add_argument("--port", type=int, default=8787)
+    s.add_argument("--bind", default="127.0.0.1")
+    s.set_defaults(func=cmd_web)
+
+    s = sub.add_parser("fan", help="fan mode, fixed duty, firmware curve")
+    s.add_argument("fan_cmd", choices=["show", "mode", "speed", "curve", "auto", "charge-limit"])
+    s.add_argument("value", nargs="?",
+                   help="mode: %s | speed: 0-100 | curve: 45:20,55:35,70:60,...  | charge-limit: 60-100"
+                        % "/".join(FAN_MODES))
+    s.set_defaults(func=cmd_fan)
+
+    s = sub.add_parser("cpu", help="package power limits and frequency ceiling")
+    s.add_argument("cpu_cmd", choices=["show", "pl1", "pl2", "maxpct", "turbo", "governor", "epp", "platform"])
+    s.add_argument("value", nargs="?")
+    s.set_defaults(func=cmd_cpu)
+
+    s = sub.add_parser("gpu", help="nvidia power limit and clock ceiling")
+    s.add_argument("gpu_cmd", choices=["show", "limit", "clocks", "reset", "boost"])
+    s.add_argument("value", nargs="?")
+    s.set_defaults(func=cmd_gpu)
+
+    s = sub.add_parser("profile", help="apply a named bundle from the config file")
+    s.add_argument("profile_cmd", choices=["list", "show", "apply"])
+    s.add_argument("name", nargs="?")
+    s.set_defaults(func=cmd_profile)
+
+    s = sub.add_parser("daemon", help="software fan curve with a thermal guard")
+    s.set_defaults(func=cmd_daemon)
+
+    s = sub.add_parser("daemon-cleanup",
+                       help="internal: ExecStopPost hook for aorusctld.service")
+    s.set_defaults(func=cmd_daemon_cleanup)
+
+    s = sub.add_parser("reset", help="undo every change this tool has made")
+    s.set_defaults(func=cmd_reset)
+
+    s = sub.add_parser("probe", help="write a read-only hardware report")
+    s.add_argument("-o", "--output")
+    s.set_defaults(func=cmd_probe)
+
+    s = sub.add_parser("version", help="version and detected backends")
+    s.set_defaults(func=cmd_version)
+    return p
+
+
+def main(argv=None):
+    global DRY_RUN, VERBOSE
+    args = build_parser().parse_args(argv)
+    DRY_RUN = args.dry_run
+    VERBOSE = args.verbose
+
+    needs_value = {
+        "fan": ("fan_cmd", ("mode", "speed", "curve", "charge-limit")),
+        "cpu": ("cpu_cmd", ("pl1", "pl2", "maxpct", "turbo", "governor", "epp", "platform")),
+        "gpu": ("gpu_cmd", ("limit", "clocks", "boost")),
+        "profile": ("profile_cmd", ("show", "apply")),
+    }
+    if args.cmd in needs_value:
+        attr, requiring = needs_value[args.cmd]
+        vattr = "name" if args.cmd == "profile" else "value"
+        if getattr(args, attr) in requiring and not getattr(args, vattr):
+            sys.stderr.write(f"aorusctl: `{args.cmd} {getattr(args, attr)}` needs a value\n")
+            return 2
+
+    try:
+        try:
+            apply_config_globals(load_config())
+        except Err:
+            pass          # a broken config must not stop you reading the sensors
+        return args.func(args) or 0
+    except Err as e:
+        sys.stderr.write(f"aorusctl: {e}\n")
+        return 1
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
