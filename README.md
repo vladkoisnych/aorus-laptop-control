@@ -11,7 +11,6 @@ been tidied up enough to be worth publishing, but it started as a personal fix
 and the hardware coverage still reflects that.
 
 ![The aorusctl browser dashboard](docs/dashboard.png)
-(Also has dark mode, depending on your system preferences)
 
 ```
 aorusctl status                    # snapshot
@@ -174,6 +173,26 @@ mode, and forces 100 percent at or above `guard_temp`.
 A fan mode you pick by hand always wins: setting one stops the daemon and says
 so. When the daemon stops for any other reason, killed included, it hands the
 fans back to the firmware.
+
+### GNOME top bar
+
+`gnome-extension/` holds a GNOME Shell extension that puts CPU and GPU
+temperature, fan speed and the current fan mode in the top bar, with quick fan
+mode buttons and a shortcut that opens the dashboard.
+
+```sh
+cd gnome-extension
+./install.sh                 # as your normal user, not with sudo
+gnome-extensions enable aorusctl@vladkoisnych.github.io
+```
+
+Log out and back in first on Wayland, or press Alt+F2 and type `r` on X11.
+
+It reads from `aorusctl-web.service` over loopback, so it needs no privileges of
+its own. Without that service running it falls back to reading sysfs, which
+still gives temperatures and fan readings but no GPU data and no controls.
+`gnome-extensions prefs aorusctl@vladkoisnych.github.io` chooses what appears in
+the panel. It follows the desktop light and dark setting.
 
 ### Running at boot
 

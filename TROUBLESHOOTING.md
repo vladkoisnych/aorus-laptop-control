@@ -158,6 +158,28 @@ you replace the binary:
 sudo systemctl restart aorusctl-web.service
 ```
 
+## The top bar extension shows nothing, or no GPU
+
+It reads from `aorusctl-web.service` over loopback. Without that running it falls
+back to sysfs, which covers temperatures and fan readings but not the GPU, and
+the fan mode buttons are disabled. The popup says which mode it is in.
+
+```sh
+sudo systemctl enable --now aorusctl-web.service
+gnome-extensions info aorusctl@vladkoisnych.github.io
+journalctl -f -o cat /usr/bin/gnome-shell        # extension errors land here
+```
+
+If the address is not the default, set it in
+`gnome-extensions prefs aorusctl@vladkoisnych.github.io`.
+
+After editing extension files, GNOME has to reload them: log out and back in on
+Wayland, or press Alt+F2 and type `r` on X11. Disabling and re-enabling the
+extension is not enough.
+
+Updating means re-running the installer, not copying one file. `./install.sh`
+in `gnome-extension/` copies everything and recompiles the schema.
+
 ## Reverting everything
 
 ```sh

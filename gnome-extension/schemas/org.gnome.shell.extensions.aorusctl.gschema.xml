@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist gettext-domain="aorusctl">
+  <schema id="org.gnome.shell.extensions.aorusctl" path="/org/gnome/shell/extensions/aorusctl/">
+    <key name="api-url" type="s">
+      <default>'http://127.0.0.1:8787'</default>
+      <summary>Dashboard address</summary>
+      <description>Where aorusctl web is listening. Controls only work over loopback.</description>
+    </key>
+    <key name="refresh-interval" type="i">
+      <default>3</default>
+      <summary>Refresh interval</summary>
+      <description>Seconds between updates.</description>
+    </key>
+    <key name="show-cpu" type="b">
+      <default>true</default>
+      <summary>Show CPU temperature in the panel</summary>
+      <description>Show CPU temperature in the panel.</description>
+    </key>
+    <key name="show-gpu" type="b">
+      <default>true</default>
+      <summary>Show GPU temperature in the panel</summary>
+      <description>Show GPU temperature in the panel.</description>
+    </key>
+    <key name="show-fan" type="b">
+      <default>true</default>
+      <summary>Show fan speed in the panel</summary>
+      <description>Show fan speed in the panel.</description>
+    </key>
+    <key name="show-mode" type="b">
+      <default>true</default>
+      <summary>Show fan mode in the panel</summary>
+      <description>Show the current fan mode in the panel.</description>
+    </key>
+    <key name="fan-unit" type="s">
+      <default>'rpm'</default>
+      <summary>Fan readout</summary>
+      <description>Show fan speed as 'rpm' or as 'duty' percent.</description>
+    </key>
+    <key name="show-icon" type="b">
+      <default>true</default>
+      <summary>Show the icon</summary>
+      <description>Show the extension icon in the panel.</description>
+    </key>
+  </schema>
+</schemalist>
