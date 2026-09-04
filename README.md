@@ -11,6 +11,7 @@ been tidied up enough to be worth publishing, but it started as a personal fix
 and the hardware coverage still reflects that.
 
 ![The aorusctl browser dashboard](docs/dashboard.png)
+(Also has dark mode, depending on your system preferences)
 
 ```
 aorusctl status                    # snapshot

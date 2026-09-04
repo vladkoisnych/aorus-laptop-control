@@ -1516,73 +1516,113 @@ def cmd_daemon(args):
 WEB_PAGE = r"""<!doctype html><html><head><meta charset="utf-8">
 <title>aorusctl</title><meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
-:root{--bg:#0d1117;--card:#161b22;--line:#272e37;--fg:#e6edf3;--dim:#8b949e;
---ok:#3fb950;--warn:#d29922;--hot:#f85149;--acc:#58a6ff;--acc2:#bc8cff}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);
-font:14px/1.5 ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
-header{padding:14px 20px;border-bottom:1px solid var(--line);display:flex;
-align-items:baseline;gap:14px;flex-wrap:wrap}
-h1{font-size:15px;margin:0;letter-spacing:.04em;text-transform:uppercase;color:var(--dim)}
-#model{font-size:13px;color:var(--fg)}#stamp{margin-left:auto;font-size:12px;color:var(--dim)}
-main{padding:20px;display:grid;gap:16px;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));max-width:1600px;align-items:start}
-.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px}
-.card h2{margin:0 0 12px;font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--dim)}
-.big{display:flex;gap:22px;flex-wrap:wrap;margin-bottom:10px}
-.big div{min-width:80px}.big b{display:block;font-size:26px;font-weight:600;font-variant-numeric:tabular-nums;line-height:1.1}
-.big span{font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.05em}
-canvas{width:100%;height:70px;display:block;margin:10px 0;background:#0a0d11;border:1px solid #1c232b;border-radius:6px}
-table{width:100%;border-collapse:collapse;font-size:13px}
-td{padding:3px 0;color:var(--dim)}td:first-child{white-space:nowrap;padding-right:12px}td:last-child{text-align:right;color:var(--fg);font-variant-numeric:tabular-nums;width:99%}
-.bar{height:6px;background:#0a0d11;border-radius:3px;overflow:hidden;margin-top:5px}
-.bar i{display:block;height:100%;background:var(--acc);transition:width .3s}
-button{background:#21262d;color:var(--fg);border:1px solid var(--line);border-radius:6px;
-padding:6px 11px;font:inherit;font-size:13px;cursor:pointer;margin:3px 3px 0 0}
-button:hover{border-color:var(--acc);color:var(--acc)}button.on{background:var(--acc);color:#07101c;border-color:var(--acc)}
-input[type=range]{width:100%;accent-color:var(--acc)}
-.row{display:flex;align-items:center;gap:10px;margin-top:10px}
-.row label{font-size:12px;color:var(--dim);min-width:74px}
-.row output{font-variant-numeric:tabular-nums;min-width:52px;text-align:right}
-#msg{margin:0 20px 20px;padding:0;color:var(--dim);font-size:12px;min-height:18px;white-space:pre-wrap;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;line-height:1.6}#msg.hot,#msg.ok{padding:10px 12px;border-radius:8px;border:1px solid var(--line);background:var(--card)}#msg.hot{border-color:#5c2626}
-.hot{color:var(--hot)}.warn{color:var(--warn)}.ok{color:var(--ok)}
-.ro{opacity:.5;pointer-events:none}
+:root{
+  color-scheme: light dark;
+  --bg:#f6f5f2; --panel:#fbfaf8; --ink:#1b1b19; --dim:#77756e; --rule:#dcd9d1;
+  --grid:#e7e4dc; --accent:#b4551a; --ok:#4e7a45; --warn:#96741a; --hot:#a8412f;
+  --mono: ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,"DejaVu Sans Mono",monospace;
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --bg:#101011; --panel:#161617; --ink:#e6e4de; --dim:#8b887f; --rule:#2a2a2b;
+    --grid:#212122; --accent:#d5813f; --ok:#7d9e6f; --warn:#c0a03c; --hot:#c9604c;
+  }
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:13px/1.5 var(--mono);
+  -webkit-font-smoothing:antialiased}
+header{display:flex;align-items:baseline;gap:16px;flex-wrap:wrap;
+  padding:12px 18px;border-bottom:1px solid var(--rule)}
+.brand{font-weight:600;letter-spacing:.02em}
+.brand::before{content:"";display:inline-block;width:7px;height:7px;margin-right:8px;
+  background:var(--accent);vertical-align:middle}
+#model{color:var(--dim)}
+#stamp{margin-left:auto;color:var(--dim);font-size:12px}
+
+main{display:grid;gap:1px;background:var(--rule);
+  grid-template-columns:repeat(auto-fit,minmax(340px,1fr));
+  border-bottom:1px solid var(--rule)}
+.panel{background:var(--panel);padding:16px 18px 18px}
+.panel h2{margin:0 0 14px;font-size:12px;font-weight:600;color:var(--dim);
+  letter-spacing:.02em}
+
+.readout{display:flex;gap:14px;flex-wrap:wrap;align-items:flex-end}
+.readout div{min-width:52px}
+.readout b{display:block;font-size:21px;font-weight:500;font-variant-numeric:tabular-nums;
+  letter-spacing:-.02em;line-height:1.15}
+.readout span{font-size:11px;color:var(--dim)}
+
+canvas{width:100%;height:56px;display:block;margin:14px 0 12px}
+
+table{width:100%;border-collapse:collapse;font-size:12px}
+tr+tr td{border-top:1px dotted var(--grid)}
+td{padding:4px 0;color:var(--dim);white-space:nowrap}
+td:last-child{text-align:right;color:var(--ink);font-variant-numeric:tabular-nums;
+  width:99%;white-space:normal}
+
+.ctl{margin-top:14px;padding-top:12px;border-top:1px solid var(--rule)}
+.row{display:flex;align-items:center;gap:10px;margin-top:8px}
+.row label{font-size:11px;color:var(--dim);min-width:66px}
+.row output{font-variant-numeric:tabular-nums;min-width:50px;text-align:right;font-size:12px}
+input[type=range]{flex:1;accent-color:var(--accent);height:16px}
+
+button{font:inherit;font-size:12px;background:none;color:var(--dim);
+  border:1px solid var(--rule);border-radius:0;padding:4px 9px;margin:4px 4px 0 0;
+  cursor:pointer;transition:color .12s,border-color .12s}
+button:hover{color:var(--ink);border-color:var(--dim)}
+button.on{color:var(--accent);border-color:var(--accent)}
+button.on::before{content:"> "}
+
+.note{font-size:11px;color:var(--warn);margin:8px 0 0;white-space:normal;line-height:1.45}
+#msg{padding:12px 18px;color:var(--dim);font-size:12px;min-height:16px;
+  white-space:pre-wrap;line-height:1.55;border-bottom:1px solid transparent}
+#msg.ok{color:var(--ok);border-color:var(--rule)}
+#msg.hot{color:var(--hot);border-color:var(--rule)}
+.ro{opacity:.4;pointer-events:none}
 </style></head><body>
-<header><h1>aorusctl</h1><span id="model"></span><span id="stamp">connecting…</span></header>
+<header>
+  <span class="brand">aorusctl</span><span id="model"></span><span id="stamp">connecting</span>
+</header>
 <main>
-<section class="card"><h2>CPU</h2>
- <div class="big">
-  <div><b id="ct">--</b><span>temp °C</span></div>
+<section class="panel"><h2>cpu</h2>
+ <div class="readout">
+  <div><b id="ct">--</b><span>temp &deg;C</span></div>
   <div><b id="cw">--</b><span>watts</span></div>
   <div><b id="cf">--</b><span>MHz</span></div>
  </div>
  <canvas id="cct" data-max="100" data-min="30"></canvas>
  <table id="ctab"></table>
- <div class="row" data-ctl><label>PL1</label><input type="range" id="pl1" min="10" max="120" step="1"><output id="pl1o"></output></div>
- <div class="row" data-ctl><label>PL2</label><input type="range" id="pl2" min="10" max="180" step="1"><output id="pl2o"></output></div>
- <div class="row" data-ctl><label>Max perf</label><input type="range" id="mpp" min="20" max="100" step="1"><output id="mppo"></output></div>
- <div data-ctl><button data-act="turbo" data-v="1">Turbo on</button><button data-act="turbo" data-v="0">Turbo off</button></div>
+ <div class="ctl" data-ctl>
+  <div class="row"><label>pl1</label><input type="range" id="pl1" min="10" max="120" step="1"><output id="pl1o"></output></div>
+  <div class="row"><label>pl2</label><input type="range" id="pl2" min="10" max="180" step="1"><output id="pl2o"></output></div>
+  <div class="row"><label>max perf</label><input type="range" id="mpp" min="20" max="100" step="1"><output id="mppo"></output></div>
+  <div><button data-act="turbo" data-v="1">turbo on</button><button data-act="turbo" data-v="0">turbo off</button></div>
+ </div>
 </section>
 
-<section class="card"><h2>GPU</h2>
- <div class="big">
-  <div><b id="gt">--</b><span>temp °C</span></div>
+<section class="panel"><h2>gpu</h2>
+ <div class="readout">
+  <div><b id="gt">--</b><span>temp &deg;C</span></div>
   <div><b id="gw">--</b><span>watts</span></div>
-  <div><b id="gc">--</b><span>SM MHz</span></div>
+  <div><b id="gc">--</b><span>sm MHz</span></div>
   <div><b id="gu">--</b><span>util %</span></div>
  </div>
  <canvas id="cgt" data-max="95" data-min="30"></canvas>
  <table id="gtab"></table>
- <div class="row" data-ctl><label>Power cap</label><input type="range" id="gpl" min="20" max="150" step="1"><output id="gplo"></output></div>
- <p id="gplwarn" style="color:var(--warn);font-size:11px;margin:4px 0 0"></p>
- <div data-ctl>
-  <button data-act="gpu_boost" data-v="0">EC boost off</button>
-  <button data-act="gpu_boost" data-v="1">EC boost on</button>
-  <button data-act="gpu_boost" data-v="2">EC boost max</button>
-  <button data-act="gpu_reset">Reset GPU limits</button>
+ <div class="ctl" data-ctl>
+  <div class="row"><label>power cap</label><input type="range" id="gpl" min="20" max="150" step="1"><output id="gplo"></output></div>
+  <p id="gplwarn" class="note"></p>
+  <div>
+   <button data-act="gpu_boost" data-v="0">boost off</button>
+   <button data-act="gpu_boost" data-v="1">boost on</button>
+   <button data-act="gpu_boost" data-v="2">boost max</button>
+   <button data-act="gpu_reset">reset</button>
+  </div>
  </div>
 </section>
 
-<section class="card"><h2>Fans</h2>
- <div class="big">
+<section class="panel"><h2>fans</h2>
+ <div class="readout">
   <div><b id="fm">--</b><span>mode</span></div>
   <div><b id="fd">--</b><span>duty %</span></div>
   <div><b id="fr">--</b><span>cpu rpm</span></div>
@@ -1590,23 +1630,34 @@ input[type=range]{width:100%;accent-color:var(--acc)}
  </div>
  <canvas id="cfr"></canvas>
  <table id="ftab"></table>
- <div data-ctl id="modes"></div>
- <p id="fanwarn" style="color:var(--warn);font-size:11px;margin:6px 0 0"></p>
- <div class="row" data-ctl><label>Fixed duty</label><input type="range" id="fspd" min="0" max="100" step="5"><output id="fspdo"></output></div>
+ <div class="ctl" data-ctl>
+  <div id="modes"></div>
+  <p id="fanwarn" class="note"></p>
+  <div class="row"><label>fixed duty</label><input type="range" id="fspd" min="0" max="100" step="5"><output id="fspdo"></output></div>
+ </div>
 </section>
 
-<section class="card"><h2>Profiles</h2>
+<section class="panel"><h2>profiles</h2>
  <div data-ctl id="profs"></div>
- <p style="color:var(--dim);font-size:12px;margin:12px 0 0">Defined in <code>/etc/aorusctl/config.toml</code>.</p>
- <div data-ctl style="margin-top:10px"><button data-act="reset">Revert everything</button></div>
+ <table><tr><td>defined in</td><td>/etc/aorusctl/config.toml</td></tr></table>
+ <div class="ctl" data-ctl><button data-act="reset">revert everything</button></div>
 </section>
 </main>
 <div id="msg"></div>
 <script>
+
 const H={cct:[],cgt:[],cfr:[]}, MAX=180;
 let RO=false;
 function push(k,v){H[k].push(v==null?0:v); if(H[k].length>MAX)H[k].shift();}
-function col(t){return t==null?'#8b949e':t>=88?'#f85149':t>=75?'#d29922':'#3fb950';}
+const CSS=getComputedStyle(document.documentElement);
+const V=n=>CSS.getPropertyValue(n).trim();
+let P={};
+function pal(){P={dim:V('--dim'),ok:V('--ok'),warn:V('--warn'),hot:V('--hot'),accent:V('--accent')};}
+pal();
+function col(t){return t==null?P.dim:t>=88?P.hot:t>=75?P.warn:P.ok;}
+function hexa(c,a){const s=c.replace('#','');
+ const r=parseInt(s.slice(0,2),16),g=parseInt(s.slice(2,4),16),b=parseInt(s.slice(4,6),16);
+ return `rgba(${r},${g},${b},${a})`;}
 function draw(id,color){
  const c=document.getElementById(id),d=H[id];
  const r=window.devicePixelRatio||1,w=c.clientWidth,h=c.clientHeight;
@@ -1615,10 +1666,12 @@ function draw(id,color){
  const lo=+c.dataset.min||0, top=Math.max(+c.dataset.max||0,...d,lo+1);
  const n=Math.max(d.length-1,1), X=i=>i/n*w,
        Y=v=>h-Math.max(0,Math.min(1,(v-lo)/(top-lo)))*(h-4)-2;
+ x.strokeStyle=V('--grid');x.lineWidth=1;
+ x.beginPath();x.moveTo(0,h-0.5);x.lineTo(w,h-0.5);x.stroke();
  x.beginPath();x.moveTo(X(0),h);
  d.forEach((v,i)=>x.lineTo(X(i),Y(v)));
  x.lineTo(X(d.length-1),h);x.closePath();
- const g=x.createLinearGradient(0,0,0,h);g.addColorStop(0,color+'55');g.addColorStop(1,color+'00');
+ const g=x.createLinearGradient(0,0,0,h);g.addColorStop(0,hexa(color,0.16));g.addColorStop(1,hexa(color,0));
  x.fillStyle=g;x.fill();
  x.beginPath();d.forEach((v,i)=>{i?x.lineTo(X(i),Y(v)):x.moveTo(X(i),Y(v))});
  x.strokeStyle=color;x.lineWidth=1.6;x.lineJoin='round';x.stroke();
@@ -1646,7 +1699,7 @@ async function tick(){
  let s; try{s=await(await fetch('/api/status')).json();}catch(e){document.getElementById('stamp').textContent='disconnected';return;}
  RO=!s.root; document.querySelectorAll('[data-ctl]').forEach(e=>e.classList.toggle('ro',RO));
  document.getElementById('model').textContent=s.model||'';
- document.getElementById('stamp').textContent=(RO?'read-only (start with sudo to control) · ':'')+new Date().toLocaleTimeString();
+ document.getElementById('stamp').textContent=(RO?'read-only, start with sudo to control  ':'')+new Date().toLocaleTimeString();
  const c=s.cpu,g=s.gpu,fa=s.fan;
  document.getElementById('ct').textContent=f(c.package_c,1);
  document.getElementById('ct').style.color=col(c.package_c);
@@ -1695,7 +1748,7 @@ async function tick(){
  document.getElementById('fd').textContent=f(fa.pwm_pct);
  document.getElementById('fr').textContent=f((fa.rpm||{}).cpu);
  document.getElementById('fr2').textContent=f((fa.rpm||{}).gpu);
- push('cfr',(fa.rpm||{}).cpu); draw('cfr','#58a6ff');
+ push('cfr',(fa.rpm||{}).cpu); draw('cfr',P.accent);
  tab('ftab',[['custom duty',fa.custom_speed_pct!=null?fa.custom_speed_pct+' %':null],
   ['ec cpu temp',fa.ec_temps&&fa.ec_temps.cpu?f(fa.ec_temps.cpu,0,' °C'):null],
   ['ec gpu temp',fa.ec_temps&&fa.ec_temps.gpu?f(fa.ec_temps.gpu,0,' °C'):null],
@@ -1716,7 +1769,7 @@ async function tick(){
   document.getElementById('fspdo').textContent=fa.custom_speed_pct+' %';}
  if(!document.getElementById('profs').dataset.done){
   document.getElementById('profs').innerHTML=(s.profiles||[]).map(p=>
-   `<button data-act="profile" data-v="${p}">${p}</button>`).join('')||'<span style="color:var(--dim)">no profiles defined</span>';
+   `<button data-act="profile" data-v="${p}">${p}</button>`).join('')||'<span style="color:var(--dim);font-size:12px">no profiles defined</span>';
   document.getElementById('profs').dataset.done=1;}
  document.querySelectorAll('#profs button').forEach(b=>b.classList.toggle('on',b.dataset.v===s.active_profile));
 }
@@ -1726,7 +1779,9 @@ slid('mpp','mppo',v=>act({action:'max_perf_pct',value:v}),' %');
 slid('gpl','gplo',v=>act({action:'gpu_power_limit',value:v}),' W');
 slid('fspd','fspdo',v=>act({action:'fan_speed',value:v}),' %');
 tick(); setInterval(tick,2000);
-window.addEventListener('resize',()=>{draw('cct',col(H.cct.at(-1)));draw('cgt',col(H.cgt.at(-1)));draw('cfr','#58a6ff')});
+matchMedia('(prefers-color-scheme: dark)').addEventListener('change',()=>{pal();redraw();});
+function redraw(){draw('cct',col(H.cct.at(-1)));draw('cgt',col(H.cgt.at(-1)));draw('cfr',P.accent);}
+window.addEventListener('resize',redraw);
 </script></body></html>"""
 
 
