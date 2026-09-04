@@ -46,11 +46,11 @@ Center uses on Windows. The firmware validates every value it gets.
 CPU power and frequency ceilings use mainline sysfs: `intel-rapl` powercap,
 `intel_pstate` and `cpufreq`.
 
-GPU power and clock ceilings go through `nvidia-smi -pl` and `-lgc`, which clamp
-to whatever the vBIOS allows. On laptops running `nvidia-powerd` the power limit
-belongs to that daemon, so the EC's Dynamic Boost toggle is the lever that
-actually works. Every GPU write is read back and a change that did not stick is
-reported as a failure rather than assumed.
+GPU power and clock ceilings go through `nvidia-smi -pl` and `-lgc`. Raising the
+power limit is mostly a lost cause on a laptop, where the vBIOS owns it and
+Dynamic Boost via `nvidia-powerd` is what actually moves it; lowering it and
+locking clocks both work. Every GPU write is read back, and a change that did not
+stick is reported as a failure rather than assumed.
 
 Nothing here writes `/dev/port`, sets `ec_sys write_support=1`, or pokes MSRs.
 That is how people brick the EC on these machines, and why the `p37-ec-*`
@@ -297,20 +297,48 @@ Common problems:
   The probe report distinguishes the two.
 - CPU watts shows `--`. Since the RAPL side-channel mitigation, `energy_uj` is
   readable only by root, so run with `sudo`.
-- `gpu limit` reverts to the default a moment after you set it. Two causes,
-  and `aorusctl gpu show` names which one you have. Persistence mode off is the
-  common one: the driver tears down GPU state whenever the last client exits and
-  the limit goes with it, so the tool now turns persistence on before setting a
-  limit. That keeps the dGPU initialised and costs battery, and `aorusctl reset`
-  puts it back. The other is `nvidia-powerd`, which owns the power limit on
-  laptops with Dynamic Boost and rewrites it every second or so. Steer the budget
-  from the EC with `aorusctl gpu boost 0|1|2` instead, or stop `nvidia-powerd` to
-  take manual control and give up Dynamic Boost. Some vBIOSes also ignore the
-  limit outright, in which case `aorusctl gpu clocks` caps the GPU by clock,
-  which they generally do honour.
+- The GPU is stuck at its base TGP and `gpu limit` will not raise it. This is
+  normal on laptops. The power limit belongs to the vBIOS and platform firmware,
+  not the driver, so `nvidia-smi -pl` reports success and the enforced limit
+  never moves. A `power.limit` of N/A is the tell. What lifts a laptop GPU above
+  base TGP is Dynamic Boost, and that is `nvidia-powerd`, so check whether it is
+  running. `aorusctl gpu show` and `status` both report its state, and
+  `sudo systemctl enable --now nvidia-powerd` is the fix when it is installed but
+  off. Capping the GPU lower does work, through `aorusctl gpu clocks`.
+- A write fails with EPERM even under sudo. `aorus-laptop` returns -1 when the
+  firmware's WMI method fails, and the kernel reports that as EPERM, so it reads
+  like a permissions error when it is really an unsupported method on your model.
+  `gpu boost` does this on the 16X ASG. The tool says as much rather than telling
+  you to use sudo.
+- `gpu limit` takes and then reverts a few seconds later. Persistence mode was
+  off, so the driver tore down GPU state when the last client exited and the
+  limit went with it. The tool turns persistence on before setting a limit. That
+  keeps the dGPU initialised and costs battery, and `aorusctl reset` puts it
+  back.
 - PL1 will not go above some value. The MMIO RAPL domain often carries a
   firmware cap, and the lower of the MSR and MMIO limits wins. `aorusctl cpu
   show` prints both, `status` prints the effective one.
+
+### Checking that Dynamic Boost works
+
+On a laptop the GPU sits at its base TGP until Dynamic Boost moves spare power
+budget over from the CPU, and that only happens under a load that is heavy on the
+GPU and light on the CPU. A light load proves nothing: at 30 W draw there is no
+pressure for anything to be reallocated.
+
+Enable the daemon, then watch the power graph while something actually pushes the
+GPU:
+
+```sh
+sudo systemctl enable --now nvidia-powerd
+sudo apt install -y vkmark          # or glmark2, or any game
+sudo aorusctl mon                   # in a second terminal
+vkmark
+```
+
+If Dynamic Boost is working, GPU watts climbs past `power.default_limit` and
+heads toward `power.max_limit`. If it stays pinned at the default under sustained
+GPU load, Dynamic Boost is not engaging on your machine.
 
 ## Not covered
 

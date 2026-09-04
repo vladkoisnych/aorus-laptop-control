@@ -26,7 +26,7 @@ import threading
 import time
 from pathlib import Path
 
-VERSION = "1.2.0"
+VERSION = "1.3.1"
 
 # ----------------------------------------------------------------------------
 # paths
@@ -102,6 +102,13 @@ def wr(path, value) -> bool:
         log(f"wrote {value!r} -> {path}")
         return True
     except PermissionError:
+        if is_root():
+            raise Err(
+                f"the driver refused the write to {path.name}.\n"
+                f"  This is EPERM while running as root, so it is not a permissions problem.\n"
+                f"  aorus-laptop returns -1 (which the kernel reports as EPERM) when the\n"
+                f"  firmware's WMI method fails, so your model most likely does not\n"
+                f"  implement this one.")
         raise Err(f"permission denied writing {path} (need root)")
     except OSError as e:
         raise Err(f"kernel rejected write {value!r} -> {path}: {e}")
@@ -672,6 +679,21 @@ class Gpu:
         p = run(["systemctl", "is-active", "nvidia-powerd"])
         return bool(p and p.stdout.strip() == "active")
 
+    def powerd_state(self):
+        """'active', 'disabled' (installed but not running), or 'absent'.
+
+        On Ada laptops Dynamic Boost is what lifts the GPU above its base TGP.
+        It is nvidia-powerd that does the lifting, so with the service off the
+        GPU sits at power.default_limit no matter what anything else asks for.
+        """
+        if self.powerd_active():
+            return "active"
+        p = run(["systemctl", "is-enabled", "nvidia-powerd"])
+        out = (p.stdout + p.stderr).strip() if p else ""
+        if not out or "not-found" in out or "No such file" in out:
+            return "absent"
+        return "disabled"
+
     def persistence_on(self):
         p = run([self.smi, "--query-gpu=persistence_mode", "--format=csv,noheader"])
         return bool(p and p.returncode == 0 and p.stdout.strip().lower().startswith("enabled"))
@@ -710,18 +732,46 @@ class Gpu:
         if got is not None and abs(got - w) > 1.5:
             hint = ""
             if self.powerd_active():
-                hint = ("\n  nvidia-powerd is running. It manages Dynamic Boost and "
-                        "rewrites the GPU power limit continuously, so it overwrites "
-                        "anything set here within a second or two."
-                        "\n  On this chassis the working lever is the EC instead:"
-                        "\n    sudo aorusctl gpu boost 2     # let the EC grant the full budget"
-                        "\n    sudo aorusctl gpu boost 0     # hold it at the base limit"
-                        "\n  To take manual control instead, stop nvidia-powerd first"
-                        "\n  (`sudo systemctl stop nvidia-powerd`), which gives up Dynamic Boost.")
+                hint = ("\n  nvidia-powerd is running, which is what you want. It manages"
+                        " Dynamic Boost and rewrites"
+                        "\n  the power limit continuously, moving budget to the GPU when the"
+                        " CPU is not using its share,"
+                        "\n  so a fixed limit set here is overwritten within a second or two."
+                        " The limit is meant to move."
+                        "\n"
+                        "\n  To cap the GPU anyway, lock its clocks instead:"
+                        "\n    sudo aorusctl gpu clocks 210,1800"
+                        "\n  Or stop nvidia-powerd first (`sudo systemctl stop nvidia-powerd`),"
+                        " which gives up Dynamic Boost"
+                        "\n  and leaves the GPU at its base TGP."
+                        "\n"
+                        "\n  `aorusctl gpu boost` steers the EC instead, but not every model"
+                        " implements that WMI method;"
+                        "\n  if it returns EPERM under sudo, yours does not.")
             else:
-                hint = ("\n  Something is reasserting the limit, or the vBIOS ignores it. "
-                        "`aorusctl gpu clocks` caps the GPU by clock instead, which "
-                        "laptop vBIOSes generally do honour.")
+                hint = ("\n  Nothing is fighting you. On laptop GPUs the power limit belongs to"
+                        " the vBIOS and platform firmware,"
+                        "\n  not the driver, so nvidia-smi accepts -pl, reports success, and the"
+                        " enforced limit never moves.")
+                if q.get("power.limit") is None:
+                    hint += ("\n  This GPU reports no enforced limit at all (power.limit is"
+                             " N/A), which is the usual sign of that.")
+                st = self.powerd_state()
+                if st == "disabled":
+                    hint += (f"\n\n  What you probably want instead: nvidia-powerd is installed"
+                             f" here but not running.\n"
+                             f"  It is what implements Dynamic Boost, so with it off the GPU"
+                             f" stays at its {q.get('power.default_limit') or 'base'} W base TGP"
+                             f" and never reaches the"
+                             f" {q.get('power.max_limit') or 'higher'} W ceiling.\n"
+                             f"    sudo systemctl enable --now nvidia-powerd\n"
+                             f"  It then raises the limit itself when CPU headroom allows, which"
+                             f" is the only route to the full budget.")
+                elif st == "absent":
+                    hint += ("\n\n  nvidia-powerd is not installed, so Dynamic Boost is"
+                             " unavailable and the GPU is capped at its base TGP.")
+                hint += ("\n\n  To cap the GPU lower rather than higher, clocks do work:"
+                         "\n    sudo aorusctl gpu clocks 210,1800")
             raise Err(f"asked for {w:.0f} W but the GPU is still at {got:.0f} W.{hint}")
 
         STATE.set_current("gpu_power_limit", w)
@@ -842,6 +892,7 @@ def snapshot():
             "mem_total_mb": g.get("memory.total"),
             "fan_pct": g.get("fan.speed"),
             "powerd": gpu.powerd_active(),
+            "powerd_state": gpu.powerd_state(),
             "persistence": gpu.persistence_on(),
         } if g else {"available": gpu.available, "name": None}),
     }
@@ -904,11 +955,16 @@ def cmd_status(args):
         if g["power_min_w"]:
             print(f"  limit range    {fmt(g['power_min_w'], '')}-{fmt(g['power_max_w'], ' W')}"
                   f"  (default {fmt(g['power_default_w'], ' W')})")
-        if g.get("powerd"):
-            print("  nvidia-powerd  running, so it owns the power limit and will "
-                  "overwrite `gpu limit`")
-            print("                 use `aorusctl gpu boost 0|1|2` to steer it from the EC")
-        elif g.get("persistence") is False:
+        st = g.get("powerd_state")
+        if st == "active":
+            print("  nvidia-powerd  running, so Dynamic Boost is managing the limit")
+        elif st == "disabled":
+            print(f"  nvidia-powerd  installed but not running, so Dynamic Boost is off and "
+                  f"the GPU is stuck at {fmt(g['power_default_w'], ' W')}")
+            print("                 sudo systemctl enable --now nvidia-powerd")
+        elif st == "absent":
+            print("  nvidia-powerd  not installed, so Dynamic Boost is unavailable")
+        if g.get("persistence") is False:
             print("  persistence    off, so limits reset when the last GPU client exits")
     else:
         print("  nvidia-smi unavailable")
@@ -1507,13 +1563,17 @@ async function tick(){
   ['vram',g.mem_total_mb?f(g.mem_used_mb,0)+' / '+f(g.mem_total_mb,0,' MB'):null],
   ['mem clock',g.clock_mem_mhz?f(g.clock_mem_mhz,0,' MHz'):null],
   ['ec gpu boost',s.fan.gpu_boost],
-  ['nvidia-powerd',g.powerd?'running (it owns the power cap)':null],
+  ['nvidia-powerd',g.powerd_state==='active'?'running':
+    g.powerd_state==='disabled'?'installed but off, so no Dynamic Boost':
+    g.powerd_state==='absent'?'not installed':null],
   ['persistence',g.persistence===false?'off':null]]);
  if(g.power_limit_w&&fresh('gpl')){const e=document.getElementById('gpl');
   e.min=Math.round(g.power_min_w||20);e.max=Math.round(g.power_max_w||150);
   e.value=Math.round(g.power_limit_w);document.getElementById('gplo').textContent=e.value+' W';}
  const gw=document.getElementById('gplwarn');
- if(gw)gw.textContent=g.powerd?'nvidia-powerd rewrites this continuously. Use EC boost below.':'';
+ if(gw)gw.textContent=g.powerd_state==='disabled'
+   ?'Laptop vBIOSes ignore this. Enable nvidia-powerd for Dynamic Boost instead.'
+   :g.powerd?'nvidia-powerd rewrites this continuously.':'';
 
  document.getElementById('fm').textContent=fa.mode||'--';
  document.getElementById('fd').textContent=f(fa.pwm_pct);
@@ -1763,7 +1823,7 @@ def cmd_gpu(args):
             print(f"{k:<24} {v}")
         print(f"{'enforced limit (read back)':<24} {gpu.enforced_limit_w()}")
         print(f"{'persistence mode':<24} {'on' if gpu.persistence_on() else 'off'}")
-        print(f"{'nvidia-powerd':<24} {'running' if gpu.powerd_active() else 'not running'}")
+        print(f"{'nvidia-powerd':<24} {gpu.powerd_state()}")
         d = gpu.power_detail()
         if d:
             print("\nnvidia-smi -q -d POWER:")
