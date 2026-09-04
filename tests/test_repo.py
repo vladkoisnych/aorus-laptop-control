@@ -70,6 +70,28 @@ class TestScripts(unittest.TestCase):
                 self.assertNotIn(b"\r\n", f.read_bytes(),
                                  "CRLF breaks the shebang on Linux")
 
+    def test_no_tracked_text_file_has_windows_line_endings(self):
+        # Same check across everything git tracks. Binary files contain \r\n by
+        # coincidence, so skip them the way git does: a NUL byte in the first
+        # 8000 means binary.
+        try:
+            out = subprocess.run(["git", "ls-files", "-z"], cwd=REPO,
+                                 capture_output=True, timeout=20)
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            self.skipTest("git not available")
+        if out.returncode != 0:
+            self.skipTest("not a git checkout")
+        for name in filter(None, out.stdout.decode().split("\0")):
+            path = REPO / name
+            try:
+                data = path.read_bytes()
+            except OSError:
+                continue
+            if b"\0" in data[:8000]:
+                continue
+            with self.subTest(file=name):
+                self.assertNotIn(b"\r\n", data, "CRLF breaks the shebang on Linux")
+
     def test_every_script_parses(self):
         for f in SCRIPTS:
             with self.subTest(file=f.relative_to(REPO)):
