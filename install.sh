@@ -156,8 +156,8 @@ step "4. Secure Boot signing key"
     if [ "$CHECK" = 1 ]; then
       echo "  would run: ./secureboot.sh key   (generate or reuse a machine owner key)"
     else
-      if "$HERE/secureboot.sh" key; then
-        "$HERE/secureboot.sh" framework
+      if bash "$HERE/secureboot.sh" key; then
+        bash "$HERE/secureboot.sh" framework
       else
         warn "could not prepare a signing key; the module will build but not load"
       fi
@@ -218,7 +218,7 @@ step "6. Building the kernel module (DKMS)"
 step "7. Loading the module"
   if [ "${DRIVER_OK:-0}" = 1 ]; then
     if [ "$SB_ON" = 1 ] && [ "$CHECK" = 0 ]; then
-      "$HERE/secureboot.sh" sign || warn "signing failed; the module will not load under Secure Boot"
+      bash "$HERE/secureboot.sh" sign || warn "signing failed; the module will not load under Secure Boot"
     fi
     do_ modprobe aorus-laptop 2>/tmp/aorus-modprobe.err
     if [ "$CHECK" = 0 ]; then
@@ -291,7 +291,7 @@ if [ "$CHECK" = 0 ] && [ "$NO_DRIVER" = 0 ] && [ "$SB_ON" = 1 ]; then
     ok "signing key already enrolled, no reboot needed"
   else
     step "11. Enrolling the signing key (one time, needs a reboot)"
-    "$HERE/secureboot.sh" enroll
+    bash "$HERE/secureboot.sh" enroll
     echo
     echo "${B}Reboot, approve the key on the blue screen, then run:${N}"
     echo "  aorusctl status"
