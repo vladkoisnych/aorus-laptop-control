@@ -176,6 +176,8 @@ fans back to the firmware.
 
 ### GNOME top bar
 
+![The gnome extension](docs/extension.png)
+
 `gnome-extension/` holds a GNOME Shell extension that puts CPU and GPU
 temperature, fan speed and the current fan mode in the top bar, with quick fan
 mode buttons and a shortcut that opens the dashboard.
