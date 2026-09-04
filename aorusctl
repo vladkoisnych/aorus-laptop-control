@@ -26,7 +26,7 @@ import threading
 import time
 from pathlib import Path
 
-VERSION = "1.3.1"
+VERSION = "1.5.0"
 
 # ----------------------------------------------------------------------------
 # paths
@@ -41,9 +41,20 @@ PLATFORM_PROFILE = Path("/sys/firmware/acpi/platform_profile")
 
 STATE_DIR = Path("/var/lib/aorusctl")
 STATE_FILE = STATE_DIR / "state.json"
+# Written when aorusctld stands down because someone picked a fan mode. The
+# unit's ExecStopPost checks it so that handing the fans back to the firmware
+# after a kill does not also undo a mode the user just chose.
+YIELD_FLAG = Path("/run/aorusctl-daemon-yielded")
 CONFIG_FILE = Path("/etc/aorusctl/config.toml")
 
 FAN_MODES = ["normal", "silent", "gaming", "custom", "auto", "fixed"]
+
+# Top of the EC's duty scale. The aorus-laptop driver passes the value straight
+# through to the firmware without clamping, and on this family the EC's range is
+# 0-229 (0xE5), not 0-255: writing 230 or more lands outside it and the fans stop
+# instead of speeding up. Override with fan_duty_max in config.toml if your model
+# differs.
+FAN_DUTY_MAX = 229
 
 DRY_RUN = False
 VERBOSE = False
@@ -235,11 +246,11 @@ class Fans:
         v = rdint(self.base / "fan_custom_speed")
         if v is None:
             return None
-        return round(v * 100 / 255) if self.byte_scale else v
+        return round(v * 100 / FAN_DUTY_MAX) if self.byte_scale else v
 
     def pwm_pct(self):
         v = rdint(self.base / "fan_pwm")
-        return round(v * 100 / 255) if v is not None else None
+        return round(v * 100 / FAN_DUTY_MAX) if v is not None else None
 
     def rpms(self):
         out = {}
@@ -259,7 +270,7 @@ class Fans:
         for i, label in {1: "cpu", 2: "gpu"}.items():
             v = rdint(self.hwmon / f"pwm{i}")
             if v is not None:
-                out[label] = round(v * 100 / 255)
+                out[label] = round(v * 100 / FAN_DUTY_MAX)
         return out
 
     def temps(self):
@@ -293,7 +304,7 @@ class Fans:
             else:
                 continue
             if self.byte_scale:
-                speed = round(speed * 100 / 255)
+                speed = round(speed * 100 / FAN_DUTY_MAX)
             pts.append((temp, clamp(speed, 0, 100)))
         return pts
 
@@ -322,7 +333,8 @@ class Fans:
         pct = clamp(int(pct), 0, 100)
         STATE.remember("fan_custom_speed_pct", self.custom_speed_pct())
         if self.byte_scale:
-            wr(self.base / "fan_custom_speed", round(pct * 255 / 100))
+            wr(self.base / "fan_custom_speed",
+               clamp(round(pct * FAN_DUTY_MAX / 100), 0, FAN_DUTY_MAX))
         else:
             # old driver: 25-100 and divisible by 5
             val = clamp(int(round(pct / 5) * 5), 25, 100)
@@ -347,7 +359,8 @@ class Fans:
         STATE.remember("fan_curve", self.curve())
         for i, (t, s) in enumerate(pts):
             wr(self.base / "fan_curve_index", i)
-            wr(self.base / "fan_curve_data", (round(s * 255 / 100) << 8) | t)
+            wr(self.base / "fan_curve_data",
+               (clamp(round(s * FAN_DUTY_MAX / 100), 0, FAN_DUTY_MAX) << 8) | t)
         STATE.set_current("fan_curve", pts)
 
     def set_charge_limit(self, pct):
@@ -801,6 +814,20 @@ class Gpu:
         STATE.set_current("gpu_clocks", [int(lo), int(hi)])
         return f"GPU clocks locked to {int(lo)}-{int(hi)} MHz"
 
+    def unlock_clocks(self):
+        if not self.smi:
+            raise Err("nvidia-smi not found")
+        need_root()
+        if DRY_RUN:
+            print("  [dry-run] nvidia-smi -rgc")
+            return "would unlock clocks"
+        p = run([self.smi, "-rgc"])
+        if p is None or p.returncode != 0:
+            msg = (p.stderr or p.stdout).strip() if p else "no output"
+            raise Err(f"nvidia-smi -rgc failed: {msg}")
+        STATE.set_current("gpu_clocks", None)
+        return "GPU clocks unlocked"
+
     def reset(self):
         if not self.smi:
             return []
@@ -837,6 +864,27 @@ def hw():
     return FANS, CPU, GPU
 
 
+def daemon_active():
+    p = run(["systemctl", "is-active", "aorusctld"])
+    return bool(p and p.stdout.strip() == "active")
+
+
+def yield_daemon(reason="a fan mode was set by hand"):
+    """Stop aorusctld so an explicit choice sticks. Returns a note, or None.
+
+    Choosing a fan mode should hold until it is changed again, so anything that
+    sets one takes the fans off the daemon rather than quietly losing to it a
+    couple of seconds later.
+    """
+    if not daemon_active():
+        return None
+    if DRY_RUN:
+        return "  [dry-run] would stop aorusctld"
+    run(["systemctl", "stop", "aorusctld"])
+    time.sleep(0.4)
+    return f"stopped aorusctld ({reason}); `sudo systemctl start aorusctld` puts it back"
+
+
 def snapshot():
     fans, cpu, gpu = hw()
     ct = cpu.temps()
@@ -857,6 +905,7 @@ def snapshot():
             "charge_mode": fans.charge_mode(),
             "gpu_boost": fans.gpu_boost(),
             "battery_cycle": fans.battery_cycle(),
+            "daemon": daemon_active(),
         },
         "cpu": {
             "package_c": ct["package"] if ct["package"] is not None else ftemps.get("cpu"),
@@ -988,6 +1037,10 @@ def cmd_status(args):
             extra.append(f"gpu_boost {f['gpu_boost']}")
         if extra:
             print("  " + "   ".join(extra))
+        if f.get("daemon"):
+            print("  aorusctld is running, so it owns the fans and will reassert fixed mode")
+            print("  within a couple of seconds of any change. `sudo systemctl stop "
+                  "aorusctld` to take over.")
     else:
         print("  unavailable: " + hw()[0].why_unavailable())
     return 0
@@ -1157,10 +1210,20 @@ DEFAULT_CONFIG = {
         "guard_temp": 92,
         "guard_speed": 100,
         "min_speed": 0,
+    },
+    "fans": {
+        "duty_max": 229,
         "curve": [[0, 0], [45, 0], [55, 22], [65, 35], [72, 48], [80, 65], [86, 85], [92, 100]],
     },
     "profiles": {},
 }
+
+
+def apply_config_globals(cfg):
+    global FAN_DUTY_MAX
+    v = (cfg.get("fans") or {}).get("duty_max")
+    if isinstance(v, int) and 100 <= v <= 255:
+        FAN_DUTY_MAX = v
 
 
 def load_config():
@@ -1193,7 +1256,10 @@ def apply_profile(name, cfg=None):
             fn()
             applied.append(label)
         except Err as e:
-            skipped.append(f"{label}: {e}")
+            # The full explanations are long by design. In a profile summary one
+            # line per skip is enough; run the command directly for the rest.
+            first = str(e).strip().splitlines()[0]
+            skipped.append(f"{label}: {first}")
 
     if "platform_profile" in p:
         attempt(f"platform_profile={p['platform_profile']}",
@@ -1213,8 +1279,12 @@ def apply_profile(name, cfg=None):
     if "gpu_power_limit" in p:
         attempt(f"gpu_pl={p['gpu_power_limit']}W", lambda: gpu.set_power_limit(p["gpu_power_limit"]))
     if "gpu_clocks" in p:
-        lo, hi = p["gpu_clocks"]
-        attempt(f"gpu_clocks={lo}-{hi}", lambda: gpu.set_clocks(lo, hi))
+        v = p["gpu_clocks"]
+        if v in ("reset", "auto", []) :
+            attempt("gpu clocks unlocked", gpu.unlock_clocks)
+        else:
+            lo, hi = v
+            attempt(f"gpu_clocks={lo}-{hi}", lambda: gpu.set_clocks(lo, hi))
     if "gpu_boost" in p:
         attempt(f"gpu_boost={p['gpu_boost']}", lambda: fans.set_gpu_boost(p["gpu_boost"]))
     if "fan_curve" in p:
@@ -1321,6 +1391,26 @@ def _restore_on_exit():
         sys.stderr.write(f"[aorusctld] restore failed: {e}\n")
 
 
+def cmd_daemon_cleanup(args):
+    """ExecStopPost hook. Hands the fans back to the firmware unless the daemon
+    stood down on purpose, in which case the mode the user picked is left alone."""
+    if YIELD_FLAG.exists():
+        mode = rd(YIELD_FLAG, "").strip()
+        YIELD_FLAG.unlink(missing_ok=True)
+        print(f"aorusctld stood down; leaving fan mode at {mode or 'your choice'}")
+        return 0
+    fans = hw()[0]
+    if not fans.available:
+        return 0
+    target = STATE.original("fan_mode") or "normal"
+    try:
+        fans.set_mode(target)
+        print(f"fan mode -> {target}")
+    except Err as e:
+        sys.stderr.write(f"aorusctl: {e}\n")
+    return 0
+
+
 def cmd_daemon(args):
     need_root()
     cfg = load_config()
@@ -1359,6 +1449,8 @@ def cmd_daemon(args):
     STATE.remember("fan_mode", fans.mode() or "normal")
     fans.set_mode("fixed")
     applied = None
+    yielded = False
+    YIELD_FLAG.unlink(missing_ok=True)
     peak = 0.0
     sys.stderr.write(f"[aorusctld] curve {curve} interval {interval}s "
                      f"guard {guard_t}C floor {min_s}%\n")
@@ -1380,6 +1472,24 @@ def cmd_daemon(args):
                     want = applied
             want = int(round(clamp(want, min_s if t < guard_t else 0, 100)))
 
+            # Reassert every tick, not only when the target duty changes. The old
+            # behaviour let an external `fan mode normal` stand until the
+            # temperature happened to move, so the fans looked like they flipped
+            # back to fixed at random minutes later.
+            mode_now = fans.mode()
+            if mode_now != "fixed":
+                # Somebody picked a mode. That is an explicit instruction, so the
+                # daemon steps aside instead of overwriting it two seconds later.
+                sys.stderr.write(f"[aorusctld] fan mode was set to {mode_now} outside "
+                                 f"the daemon, so the daemon is standing down and "
+                                 f"leaving the fans alone.\n")
+                yielded = True
+                try:
+                    YIELD_FLAG.write_text(mode_now)
+                except OSError:
+                    pass
+                break
+
             if want != applied:
                 try:
                     fans.set_speed_pct(want)
@@ -1392,7 +1502,10 @@ def cmd_daemon(args):
 
             _daemon_stop.wait(interval)
     finally:
-        _restore_on_exit()
+        if not yielded:
+            _restore_on_exit()
+        else:
+            sys.stderr.write("[aorusctld] leaving the fans as you set them.\n")
     return 0
 
 
@@ -1478,6 +1591,7 @@ input[type=range]{width:100%;accent-color:var(--acc)}
  <canvas id="cfr"></canvas>
  <table id="ftab"></table>
  <div data-ctl id="modes"></div>
+ <p id="fanwarn" style="color:var(--warn);font-size:11px;margin:6px 0 0"></p>
  <div class="row" data-ctl><label>Fixed duty</label><input type="range" id="fspd" min="0" max="100" step="5"><output id="fspdo"></output></div>
 </section>
 
@@ -1517,6 +1631,8 @@ async function act(body){
  const m=document.getElementById('msg'); m.textContent='working…';
  const r=await fetch('/api/action',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
  const j=await r.json(); m.textContent=j.message||''; m.className=j.ok?'ok':'hot'; tick();
+ clearTimeout(window._msgT);
+ if(j.ok)window._msgT=setTimeout(()=>{m.textContent='';m.className='';},8000);
 }
 document.addEventListener('click',e=>{const b=e.target.closest('button[data-act]');if(b)act({action:b.dataset.act,value:b.dataset.v})});
 const slid=(id,out,fn,unit)=>{const el=document.getElementById(id),o=document.getElementById(out);
@@ -1583,6 +1699,7 @@ async function tick(){
  tab('ftab',[['custom duty',fa.custom_speed_pct!=null?fa.custom_speed_pct+' %':null],
   ['ec cpu temp',fa.ec_temps&&fa.ec_temps.cpu?f(fa.ec_temps.cpu,0,' °C'):null],
   ['ec gpu temp',fa.ec_temps&&fa.ec_temps.gpu?f(fa.ec_temps.gpu,0,' °C'):null],
+  ['managed by',fa.daemon?'aorusctld (it reasserts fixed mode)':null],
   ['charge limit',fa.charge_limit?fa.charge_limit+' %':null],
   ['battery cycles',fa.battery_cycle||null],
   ['driver',fa.available?'aorus-laptop':'unavailable']]);
@@ -1591,6 +1708,10 @@ async function tick(){
    `<button data-act="fan_mode" data-v="${m}">${m}</button>`).join('');
   document.getElementById('modes').dataset.done=1;}
  document.querySelectorAll('#modes button').forEach(b=>b.classList.toggle('on',b.dataset.v===fa.mode));
+ const fw=document.getElementById('fanwarn');
+ if(fw)fw.textContent=fa.daemon
+   ?'aorusctld is running and will reassert fixed mode within a couple of seconds. Stop it to control the fans here.'
+   :'';
  if(fa.custom_speed_pct!=null&&fresh('fspd')){document.getElementById('fspd').value=fa.custom_speed_pct;
   document.getElementById('fspdo').textContent=fa.custom_speed_pct+' %';}
  if(!document.getElementById('profs').dataset.done){
@@ -1672,12 +1793,15 @@ def cmd_web(args):
                 if not is_root():
                     raise Err("started without root - restart with sudo to change anything")
                 if a == "fan_mode":
-                    fans.set_mode(v); msg = f"fan mode {v}"
+                    note = yield_daemon("a fan mode was picked in the dashboard")
+                    fans.set_mode(v)
+                    msg = f"fan mode {v}" + (f"  ({note})" if note else "")
                 elif a == "fan_speed":
+                    note = yield_daemon("a fixed duty was set in the dashboard")
                     fans.set_speed_pct(v)
                     if fans.mode() not in ("fixed", "auto"):
                         fans.set_mode("fixed")
-                    msg = f"fan fixed at {v}%"
+                    msg = f"fan fixed at {v}%" + (f"  ({note})" if note else "")
                 elif a == "pl1":
                     msg = "; ".join(cpu.set_pl1(float(v)))
                 elif a == "pl2":
@@ -1738,7 +1862,8 @@ def cmd_fan(args):
             print("fan driver unavailable: " + fans.why_unavailable())
             return 1
         print(f"mode          {fans.mode()}")
-        print(f"custom duty   {fmt(fans.custom_speed_pct(), ' %')}")
+        print(f"custom duty   {fmt(fans.custom_speed_pct(), ' %')}   "
+              f"(100% = EC value {FAN_DUTY_MAX})")
         print(f"current duty  {fmt(fans.pwm_pct(), ' %')}")
         print(f"rpm           " + ("  ".join(f"{k}:{v}" for k, v in fans.rpms().items()) or "--"))
         pts = fans.curve()
@@ -1750,6 +1875,9 @@ def cmd_fan(args):
     need_root()
     if not fans.available:
         raise Err(fans.why_unavailable())
+    note = yield_daemon(f"you ran `fan {args.fan_cmd}`")
+    if note:
+        print(note)
     if args.fan_cmd == "mode":
         fans.set_mode(args.value)
         print(f"fan mode -> {args.value}")
@@ -1947,6 +2075,10 @@ def build_parser():
     s = sub.add_parser("daemon", help="software fan curve with a thermal guard")
     s.set_defaults(func=cmd_daemon)
 
+    s = sub.add_parser("daemon-cleanup",
+                       help="internal: ExecStopPost hook for aorusctld.service")
+    s.set_defaults(func=cmd_daemon_cleanup)
+
     s = sub.add_parser("reset", help="undo every change this tool has made")
     s.set_defaults(func=cmd_reset)
 
@@ -1979,6 +2111,10 @@ def main(argv=None):
             return 2
 
     try:
+        try:
+            apply_config_globals(load_config())
+        except Err:
+            pass          # a broken config must not stop you reading the sensors
         return args.func(args) or 0
     except Err as e:
         sys.stderr.write(f"aorusctl: {e}\n")

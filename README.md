@@ -254,8 +254,11 @@ back to firmware defaults as it stops:
 sudo systemctl disable --now aorusctl-profile.service
 ```
 
-`aorusctld` restores the previous fan mode whenever it stops, killed or not, so
-disabling it will never leave the fans pinned.
+A fan mode you pick by hand always wins. Setting one from the command line or the
+dashboard stops `aorusctld` first and says so, and if the mode changes some other
+way the daemon notices within a tick, stands down, and leaves the fans as you set
+them. `sudo systemctl start aorusctld` puts it back in charge. When it stops for
+any other reason, killed included, it hands the fans back to the firmware.
 
 `uninstall.sh` disables and removes all three units, so you do not need to do
 this by hand first.
@@ -297,6 +300,15 @@ Common problems:
   The probe report distinguishes the two.
 - CPU watts shows `--`. Since the RAPL side-channel mitigation, `energy_uj` is
   readable only by root, so run with `sudo`.
+- The fans stop instead of speeding up above some duty. The EC's scale tops out
+  at 229, not 255, and the kernel driver passes the value through unclamped, so
+  anything past the top of the range lands outside it and the fans stop. 100
+  percent maps to `fans.duty_max` in the config, which defaults to 229. Lower it
+  if your model still stops short of full speed.
+- Fan mode flips back to fixed on its own and the duty moves around. That was
+  `aorusctld` overriding you, and it no longer does: picking a mode stops the
+  daemon. Duty moving on its own in normal mode is just the firmware curve and is
+  expected.
 - The GPU is stuck at its base TGP and `gpu limit` will not raise it. This is
   normal on laptops. The power limit belongs to the vBIOS and platform firmware,
   not the driver, so `nvidia-smi -pl` reports success and the enforced limit

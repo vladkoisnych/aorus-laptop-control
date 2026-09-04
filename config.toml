@@ -12,8 +12,10 @@
 # turbo         true/false
 # governor      performance | powersave
 # epp           performance | balance_performance | balance_power | power
-# gpu_power_limit  watts, clamped to what the vBIOS allows
-# gpu_clocks    [min_mhz, max_mhz] hard clock lock
+# gpu_power_limit  watts, clamped to what the vBIOS allows. Most laptop vBIOSes
+#               ignore this outright, so it is reported as skipped there. Use
+#               gpu_clocks to cap a laptop GPU instead.
+# gpu_clocks    [min_mhz, max_mhz] hard clock lock, or "reset" to release one
 # gpu_boost     EC-side dynamic boost, 0-2
 # charge_limit  60-100
 # platform_profile  low-power | balanced | performance, if the firmware exposes it
@@ -22,6 +24,16 @@
 #   cpu_pl1          firmware caps the MMIO domain at 55 W, so 55 is the ceiling
 #   cpu_pl2          no published max; 157 W is what the firmware ships with
 #   gpu_power_limit  5-140 W, default 95 W (140 W is the full Dynamic Boost budget)
+
+
+[fans]
+# Top of the embedded controller's duty scale, which 100 percent maps onto.
+# The kernel driver passes duty straight through without clamping, and on this
+# family the EC range is 0-229 (0xE5) rather than 0-255. Writing 230 or more
+# lands outside it and the fans stop instead of speeding up. Lower this if your
+# model stops the fans below 100 percent; raise it to 255 if full speed feels
+# short on yours.
+duty_max = 229
 
 
 [daemon]
@@ -59,6 +71,7 @@ max_perf_pct    = 55
 turbo           = false
 epp             = "power"
 gpu_power_limit = 60
+gpu_clocks      = [210, 900]
 
 [profiles.balanced]
 fan_mode        = "normal"
@@ -69,6 +82,7 @@ turbo           = true
 governor        = "powersave"
 epp             = "balance_performance"
 gpu_power_limit = 105
+gpu_clocks      = "reset"
 
 [profiles.gaming]
 fan_mode        = "gaming"
@@ -78,6 +92,7 @@ max_perf_pct    = 100
 turbo           = true
 epp             = "performance"
 gpu_power_limit = 140
+gpu_clocks      = "reset"
 gpu_boost       = 2
 
 [profiles.battery]
@@ -89,6 +104,7 @@ turbo           = false
 governor        = "powersave"
 epp             = "power"
 gpu_power_limit = 45
+gpu_clocks      = [210, 700]
 charge_limit    = 80
 
 [profiles.cool]
@@ -100,3 +116,4 @@ cpu_pl2         = 80
 turbo           = true
 epp             = "balance_performance"
 gpu_power_limit = 100
+gpu_clocks      = [210, 1600]
