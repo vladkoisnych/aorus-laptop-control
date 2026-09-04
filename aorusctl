@@ -356,7 +356,10 @@ class Fans:
         # pad to 15 by repeating the last point
         while len(pts) < 15:
             pts.append(pts[-1])
-        STATE.remember("fan_curve", self.curve())
+        # Reading the curve moves the firmware's index cursor, so only do it
+        # the first time, when there is actually an original worth keeping.
+        if STATE.original("fan_curve") is None:
+            STATE.remember("fan_curve", self.curve())
         for i, (t, s) in enumerate(pts):
             wr(self.base / "fan_curve_index", i)
             wr(self.base / "fan_curve_data",
@@ -1337,21 +1340,17 @@ def cmd_reset(args):
         except Err as e:
             msgs.append(f"! {key}: {e}")
 
-    # fan mode last, so the fans are not left in a custom mode with a stale duty
-    if not fans.available:
-        pass
-    elif "fan_mode" in orig:
+    # Fan mode last, so the fans are never left in a custom mode with a stale
+    # duty. Only when we recorded one: reset undoes this tool's own changes, and
+    # forcing "normal" on a machine it never touched would override a mode the
+    # user or the firmware set. `aorusctl fan auto` is the explicit way to hand
+    # the fans back.
+    if fans.available and "fan_mode" in orig:
         try:
             fans.set_mode(orig["fan_mode"])
             msgs.append(f"fan mode -> {orig['fan_mode']}")
         except Err as e:
             msgs.append(f"! fan mode: {e}")
-    elif fans.available:
-        try:
-            fans.set_mode("normal")
-            msgs.append("fan mode -> normal")
-        except Err:
-            pass
 
     if gpu.available:
         msgs += gpu.reset()
@@ -1949,8 +1948,20 @@ def cmd_fan(args):
     elif args.fan_cmd == "curve":
         pts = []
         for chunk in args.value.split(","):
-            t, s = chunk.split(":")
-            pts.append((int(t), int(s)))
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            t, sep, sp = chunk.partition(":")
+            if not sep or not t.strip().lstrip("-").isdigit() \
+                    or not sp.strip().lstrip("-").isdigit():
+                raise Err(
+                    f"could not read {chunk!r} as a curve point.\n"
+                    f"  Expected temperature:duty pairs separated by commas, "
+                    f"for example:\n"
+                    f"    45:15,55:25,65:40,72:55,80:70,86:85,92:100")
+            pts.append((int(t), int(sp)))
+        if not pts:
+            raise Err("no curve points given")
         fans.set_curve(pts)
         fans.set_mode("custom")
         print(f"wrote {len(pts)} curve points and switched to custom mode")
