@@ -37,29 +37,15 @@ the battery charge limit and cycle count.
 
 ## How it talks to the hardware
 
-Three separate paths, none of them writing the embedded controller directly.
-
-Fans, EC temperatures, charge limit and GPU boost go through the `aorus-laptop`
-WMI kernel driver, which calls the same `WMBC` and `WMBD` ACPI methods Control
-Center uses on Windows. The firmware validates every value it gets.
-
-CPU power and frequency ceilings use mainline sysfs: `intel-rapl` powercap,
-`intel_pstate` and `cpufreq`.
-
-GPU power and clock ceilings go through `nvidia-smi -pl` and `-lgc`. Raising the
-power limit is mostly a lost cause on a laptop, where the vBIOS owns it and
-Dynamic Boost via `nvidia-powerd` is what actually moves it; lowering it and
-locking clocks both work. Every GPU write is read back, and a change that did not
-stick is reported as a failure rather than assumed.
-
-Nothing here writes `/dev/port`, sets `ec_sys write_support=1`, or pokes MSRs.
-That is how people brick the EC on these machines, and why the `p37-ec-*`
-scripts you find online are model specific and dangerous on the wrong model.
+Fans go through the `aorus-laptop` WMI kernel driver, which calls the same ACPI
+methods Control Center uses on Windows. CPU limits use mainline `intel-rapl`,
+`intel_pstate` and `cpufreq` sysfs. GPU limits go through `nvidia-smi`. Nothing
+writes the embedded controller directly, which is what makes the `p37-ec-*`
+scripts you find online dangerous on the wrong model.
 
 The kernel module is not part of this repository. `install.sh` downloads
 [tangalbert919/gigabyte-laptop-wmi](https://github.com/tangalbert919/gigabyte-laptop-wmi)
-at a pinned commit, checks its SHA-256, and builds it through DKMS so it
-survives kernel upgrades.
+at a pinned commit, verifies its SHA-256, and builds it through DKMS.
 
 ## Hardware
 
@@ -103,37 +89,26 @@ To remove everything and put the hardware back to firmware defaults:
 sudo ./uninstall.sh
 ```
 
-### Secure Boot
-
-With Secure Boot on, the kernel refuses any module it cannot verify, so this one
-has to be signed with a key you enroll yourself. The installer generates a
-machine owner key, points DKMS at it so future kernel rebuilds get signed too,
-signs the module, and runs `mokutil --import` at the end.
-
-That needs a reboot. Before the OS starts you get a blue MOK management screen:
-Enroll MOK, Continue, Yes, type the one-time password the installer asked you to
-choose, Reboot.
-
-If something looks wrong afterwards, this reports the Secure Boot state, whether
-the key exists and is enrolled, whether the module is signed and by whom, and
-what `modprobe` says:
-
-```sh
-sudo /usr/local/share/aorusctl/secureboot.sh status
-```
-
-`sign`, `enroll` and `setup` are the other subcommands. All of them are safe to
-re-run.
-
-Turning Secure Boot off in the BIOS also works, but avoid it on a dual-boot
-machine: Windows treats the change as tampering and BitLocker will ask for your
-recovery key at the next boot.
-
-Signing does not weaken Secure Boot. The key is generated on your machine, never
-leaves it, is readable only by root, and you approve it by hand at the firmware
-prompt. It signs modules built on this machine and nothing else.
+With Secure Boot on, the installer generates a machine owner key, signs the
+module, and runs `mokutil --import`. You then reboot once and approve the key on
+the blue MOK management screen. See
+[TROUBLESHOOTING.md](TROUBLESHOOTING.md#secure-boot) for the details and for what
+to do when it goes wrong.
 
 ## Use
+
+> **Warning.** Fan curves and power limits are yours to get wrong. A curve that
+> ramps too late, a fixed duty set too low, or a raised power limit can let the
+> machine run hotter than the firmware would ever allow, and sustained heat
+> shortens the life of the hardware. Expect thermal shutdowns from a bad
+> configuration, and treat anything that lowers fan speed or raises power as
+> something to watch under load before you leave it running. `aorusctl reset`
+> undoes everything, and `sudo aorusctl fan auto` hands the fans straight back to
+> the firmware.
+>
+> The CPU and GPU keep their own hardware thermal throttling, which nothing here
+> can disable, so a bad configuration costs performance and stability rather than
+> instantly destroying anything. It is still your machine and your risk.
 
 ```sh
 aorusctl status                    # no root needed
@@ -154,7 +129,7 @@ sudo aorusctl cpu turbo off
 sudo aorusctl cpu epp power
 aorusctl cpu show
 
-sudo aorusctl gpu limit 100        # watts, clamped to what the vBIOS allows
+sudo aorusctl gpu limit 100        # watts, ignored by most laptop vBIOSes
 sudo aorusctl gpu boost 2          # EC Dynamic Boost: 0 off, 1 on, 2 max
 sudo aorusctl gpu clocks 210,1800  # hard SM clock lock, MHz
 sudo aorusctl gpu reset
@@ -185,27 +160,19 @@ cpu_pl1         = 45
 cpu_pl2         = 80
 turbo           = true
 epp             = "balance_performance"
-gpu_power_limit = 100
+gpu_clocks      = [210, 1600]
 ```
-
-To apply one at every boot, see [Running at boot](#running-at-boot).
 
 ### The fan daemon
 
-The firmware curve is usually the better choice, and `aorusctl fan curve` writes
-straight into it, so nothing has to keep running.
+`aorusctl fan curve` writes into the firmware's own curve, so nothing has to keep
+running. `aorusctld` exists for a curve driven by sensors the EC cannot see. It
+tracks the hottest of CPU, GPU and EC temperatures, drives the fans in fixed
+mode, and forces 100 percent at or above `guard_temp`.
 
-`aorusctld` is for when you want a curve driven by sensors the EC cannot see, or
-hysteresis the firmware does not offer. It samples the hottest of CPU package,
-GPU and EC temperatures, drives the fans in fixed mode, and restores the previous
-fan mode when it stops: on clean exit, on SIGTERM, and through `ExecStopPost` if
-it gets killed outright. At or above `guard_temp` the fans go to 100 percent
-whatever the curve says.
-
-```sh
-sudo systemctl enable --now aorusctld.service
-journalctl -u aorusctld -f
-```
+A fan mode you pick by hand always wins: setting one stops the daemon and says
+so. When the daemon stops for any other reason, killed included, it hands the
+fans back to the firmware.
 
 ### Running at boot
 
@@ -217,23 +184,11 @@ journalctl -u aorusctld -f
 | `aorusctld.service` | runs the software fan curve and thermal guard |
 | `aorusctl-profile.service` | applies one profile at every boot |
 
-`--now` starts a unit immediately as well as enabling it for future boots:
+`--now` acts immediately as well as changing what happens at boot:
 
 ```sh
 sudo systemctl enable --now aorusctl-web.service
-sudo systemctl enable --now aorusctld.service
-```
-
-And stops it immediately as well as disabling it:
-
-```sh
 sudo systemctl disable --now aorusctl-web.service
-sudo systemctl disable --now aorusctld.service
-```
-
-To see what a unit is doing, and follow its log:
-
-```sh
 systemctl status aorusctl-web.service
 journalctl -u aorusctld -f
 ```
@@ -247,110 +202,31 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now aorusctl-profile.service
 ```
 
-Disabling that one runs `aorusctl reset` through `ExecStop`, so the hardware goes
-back to firmware defaults as it stops:
-
-```sh
-sudo systemctl disable --now aorusctl-profile.service
-```
-
-A fan mode you pick by hand always wins. Setting one from the command line or the
-dashboard stops `aorusctld` first and says so, and if the mode changes some other
-way the daemon notices within a tick, stands down, and leaves the fans as you set
-them. `sudo systemctl start aorusctld` puts it back in charge. When it stops for
-any other reason, killed included, it hands the fans back to the firmware.
-
-`uninstall.sh` disables and removes all three units, so you do not need to do
-this by hand first.
+Disabling that one runs `aorusctl reset` through `ExecStop`. `uninstall.sh`
+removes all three units for you.
 
 ## Safety
 
-Every write is clamped to the range the kernel or firmware reports. Where the
-firmware publishes no maximum, the write is attempted and the kernel's rejection
-is reported rather than guessed at.
+Writes are clamped to what the kernel or firmware reports, GPU writes are read
+back and a change that did not stick is reported as a failure, and the original
+value of anything changed is recorded in `/var/lib/aorusctl/state.json` so
+`aorusctl reset` can put it back. The web dashboard binds to `127.0.0.1` and
+refuses control requests from anywhere else.
 
-The first value seen for anything changed is recorded in
-`/var/lib/aorusctl/state.json`, and `aorusctl reset` puts all of it back.
+On a dual boot, the fan curve, charge limit and GPU boost live in EC registers
+Control Center writes too, so whichever OS booted last wins.
 
-The web dashboard binds to `127.0.0.1` and the API refuses control requests from
-any other address. Do not change `--bind` unless you mean to.
+## Something not working
 
-Thermal throttling in the CPU and GPU is a hardware feature that nothing here
-touches. A bad fan curve costs you performance and cannot damage anything.
-
-On a dual boot, the firmware fan curve, charge limit and GPU boost live in EC
-registers that Control Center writes too, so whichever OS booted last wins. Fan
-mode and power limits do not survive a power cycle either way.
-
-## Troubleshooting
+Start with the probe, which is read only:
 
 ```sh
-sudo ./probe.sh    # writes aorus-probe-report.txt, reads only
+sudo ./probe.sh
 ```
 
-The report covers DMI strings, which WMI GUIDs are exposed, the hwmon tree, RAPL
-domains, `intel_pstate`, `nvidia-smi` capabilities, whether the DSDT contains
-`WMBC` and `WMBD`, and what fan software is already running. Attach it to an
-issue.
-
-Common problems:
-
-- FANS section says unavailable. Either the module is not loaded, which usually
-  means Secure Boot, or your firmware does not expose the Gigabyte WMI GUIDs.
-  The probe report distinguishes the two.
-- CPU watts shows `--`. Since the RAPL side-channel mitigation, `energy_uj` is
-  readable only by root, so run with `sudo`.
-- The fans stop instead of speeding up above some duty. The EC's scale tops out
-  at 229, not 255, and the kernel driver passes the value through unclamped, so
-  anything past the top of the range lands outside it and the fans stop. 100
-  percent maps to `fans.duty_max` in the config, which defaults to 229. Lower it
-  if your model still stops short of full speed.
-- Fan mode flips back to fixed on its own and the duty moves around. That was
-  `aorusctld` overriding you, and it no longer does: picking a mode stops the
-  daemon. Duty moving on its own in normal mode is just the firmware curve and is
-  expected.
-- The GPU is stuck at its base TGP and `gpu limit` will not raise it. This is
-  normal on laptops. The power limit belongs to the vBIOS and platform firmware,
-  not the driver, so `nvidia-smi -pl` reports success and the enforced limit
-  never moves. A `power.limit` of N/A is the tell. What lifts a laptop GPU above
-  base TGP is Dynamic Boost, and that is `nvidia-powerd`, so check whether it is
-  running. `aorusctl gpu show` and `status` both report its state, and
-  `sudo systemctl enable --now nvidia-powerd` is the fix when it is installed but
-  off. Capping the GPU lower does work, through `aorusctl gpu clocks`.
-- A write fails with EPERM even under sudo. `aorus-laptop` returns -1 when the
-  firmware's WMI method fails, and the kernel reports that as EPERM, so it reads
-  like a permissions error when it is really an unsupported method on your model.
-  `gpu boost` does this on the 16X ASG. The tool says as much rather than telling
-  you to use sudo.
-- `gpu limit` takes and then reverts a few seconds later. Persistence mode was
-  off, so the driver tore down GPU state when the last client exited and the
-  limit went with it. The tool turns persistence on before setting a limit. That
-  keeps the dGPU initialised and costs battery, and `aorusctl reset` puts it
-  back.
-- PL1 will not go above some value. The MMIO RAPL domain often carries a
-  firmware cap, and the lower of the MSR and MMIO limits wins. `aorusctl cpu
-  show` prints both, `status` prints the effective one.
-
-### Checking that Dynamic Boost works
-
-On a laptop the GPU sits at its base TGP until Dynamic Boost moves spare power
-budget over from the CPU, and that only happens under a load that is heavy on the
-GPU and light on the CPU. A light load proves nothing: at 30 W draw there is no
-pressure for anything to be reallocated.
-
-Enable the daemon, then watch the power graph while something actually pushes the
-GPU:
-
-```sh
-sudo systemctl enable --now nvidia-powerd
-sudo apt install -y vkmark          # or glmark2, or any game
-sudo aorusctl mon                   # in a second terminal
-vkmark
-```
-
-If Dynamic Boost is working, GPU watts climbs past `power.default_limit` and
-heads toward `power.max_limit`. If it stays pinned at the default under sustained
-GPU load, Dynamic Boost is not engaging on your machine.
+[TROUBLESHOOTING.md](TROUBLESHOOTING.md) covers what the report contains, Secure
+Boot, fans stopping at high duty, GPU power limits that will not move, Dynamic
+Boost, and the errors that look like permission problems but are not.
 
 ## Not covered
 
