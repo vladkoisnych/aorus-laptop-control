@@ -1,0 +1,102 @@
+# /etc/aorusctl/config.toml
+#
+# Every key is optional. Anything the hardware refuses is reported as "skipped"
+# and the rest of the profile still applies. `sudo aorusctl reset` undoes the lot.
+#
+# fan_mode      normal | silent | gaming | custom | auto | fixed
+# fan_speed     0-100, only bites in fixed/auto mode
+# fan_curve     up to 15 [temp_c, duty_pct] pairs, non-decreasing in both columns,
+#               written into the firmware's own curve; needs fan_mode = "custom"
+# cpu_pl1/pl2   package power limits in watts (RAPL long_term / short_term)
+# max_perf_pct  ceiling on intel_pstate's performance window, 20-100
+# turbo         true/false
+# governor      performance | powersave
+# epp           performance | balance_performance | balance_power | power
+# gpu_power_limit  watts, clamped to what the vBIOS allows
+# gpu_clocks    [min_mhz, max_mhz] hard clock lock
+# gpu_boost     EC-side dynamic boost, 0-2
+# charge_limit  60-100
+# platform_profile  low-power | balanced | performance, if the firmware exposes it
+#
+# Measured ranges on this machine (AORUS 16X ASG, i7-14650HX, RTX 4070):
+#   cpu_pl1          firmware caps the MMIO domain at 55 W, so 55 is the ceiling
+#   cpu_pl2          no published max; 157 W is what the firmware ships with
+#   gpu_power_limit  5-140 W, default 95 W (140 W is the full Dynamic Boost budget)
+
+
+[daemon]
+# Software fan curve, used by aorusctld. It drives the fans in "fixed" mode from
+# the hottest of CPU package / GPU / EC sensors, and always restores the previous
+# fan mode when it stops. Only relevant if you prefer this over the firmware curve.
+enabled     = true
+interval    = 2.0      # seconds between samples
+hysteresis  = 3.0      # degrees the temperature must fall before duty drops
+guard_temp  = 92       # at or above this, fans go straight to guard_speed
+guard_speed = 100
+# Duty floor. 0 means the fans are allowed to stop completely at idle, which is
+# what you want for silence. The one caveat: if the daemon is SIGKILLed outside
+# systemd, the fans stay wherever it left them. Running it as aorusctld.service
+# covers that (ExecStopPost hands the fans back to the firmware even after a
+# kill). Set this to 15-20 if you would rather not rely on that.
+min_speed   = 0
+curve = [
+  [0,   0],   # silent right up to 45 C
+  [45,  0],
+  [55, 22],
+  [65, 35],
+  [72, 48],
+  [80, 65],
+  [86, 85],
+  [92, 100],
+]
+
+
+[profiles.silent]
+fan_mode        = "silent"
+cpu_pl1         = 25
+cpu_pl2         = 35
+max_perf_pct    = 55
+turbo           = false
+epp             = "power"
+gpu_power_limit = 60
+
+[profiles.balanced]
+fan_mode        = "normal"
+cpu_pl1         = 45
+cpu_pl2         = 110
+max_perf_pct    = 100
+turbo           = true
+governor        = "powersave"
+epp             = "balance_performance"
+gpu_power_limit = 105
+
+[profiles.gaming]
+fan_mode        = "gaming"
+cpu_pl1         = 55
+cpu_pl2         = 157
+max_perf_pct    = 100
+turbo           = true
+epp             = "performance"
+gpu_power_limit = 140
+gpu_boost       = 2
+
+[profiles.battery]
+fan_mode        = "silent"
+cpu_pl1         = 20
+cpu_pl2         = 30
+max_perf_pct    = 45
+turbo           = false
+governor        = "powersave"
+epp             = "power"
+gpu_power_limit = 45
+charge_limit    = 80
+
+[profiles.cool]
+# Same headroom as balanced, but the fans start earlier so the chassis stays cooler.
+fan_mode        = "custom"
+fan_curve       = [[40,15],[50,25],[60,40],[68,55],[75,70],[82,85],[88,100]]
+cpu_pl1         = 45
+cpu_pl2         = 80
+turbo           = true
+epp             = "balance_performance"
+gpu_power_limit = 100

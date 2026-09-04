@@ -1,0 +1,20 @@
+# probe output, which contains machine-specific DMI and firmware details
+aorus-probe-report.txt
+*.log
+
+# build leftovers if anyone builds the driver in-tree
+*.o
+*.ko
+*.ko.*
+*.mod
+*.mod.c
+.*.cmd
+Module.symvers
+modules.order
+.tmp_versions/
+
+# driver source fetched by install.sh
+/.driver-cache/
+
+__pycache__/
+*.pyc
