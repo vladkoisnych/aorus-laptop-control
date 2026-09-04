@@ -75,7 +75,7 @@ fi
 
 step "2. Checking WMI interface"
 GUID_HI="ABBC0F6F-8EA1-11D1-00A0-C90629100000"
-GUID_LO=$(echo "$GUID_HI" | tr 'A-Z' 'a-z')
+GUID_LO=$(echo "$GUID_HI" | tr '[:upper:]' '[:lower:]')
 if [ -e "/sys/bus/wmi/devices/$GUID_HI" ] || [ -e "/sys/bus/wmi/devices/$GUID_LO" ]; then
   ok "Gigabyte WMBC method GUID present - the fan driver should bind"
 else
@@ -86,18 +86,20 @@ fi
 
 step "3. Dependencies"
 NEED=()
-command -v dkms      >/dev/null || NEED+=(dkms)
 command -v make      >/dev/null || NEED+=(build-essential)
 command -v python3   >/dev/null || NEED+=(python3)
 command -v curl      >/dev/null || NEED+=(curl)
 command -v sensors   >/dev/null || NEED+=(lm-sensors)
 command -v iasl      >/dev/null || NEED+=(acpica-tools)
-[ -d "/lib/modules/$(uname -r)/build" ] || NEED+=("linux-headers-$(uname -r)")
-if [ "$NO_DRIVER" = 1 ]; then NEED=("${NEED[@]/dkms}"); fi
-if [ ${#NEED[@]} -gt 0 ] && [ -n "${NEED[*]// }" ]; then
+# Only the kernel module needs these, so --no-driver should not drag them in
+if [ "$NO_DRIVER" = 0 ]; then
+  command -v dkms >/dev/null || NEED+=(dkms)
+  [ -d "/lib/modules/$(uname -r)/build" ] || NEED+=("linux-headers-$(uname -r)")
+fi
+if [ ${#NEED[@]} -gt 0 ]; then
   echo "  installing: ${NEED[*]}"
   do_ apt-get update -qq
-  do_ apt-get install -y ${NEED[*]} || warn "apt could not install everything; continuing"
+  do_ apt-get install -y "${NEED[@]}" || warn "apt could not install everything; continuing"
 else
   ok "all dependencies present"
 fi

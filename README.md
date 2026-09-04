@@ -1,5 +1,9 @@
 # aorus-dashboard
 
+[![ci](https://github.com/vladkoisnych/aorus-dashboard/actions/workflows/ci.yml/badge.svg)](https://github.com/vladkoisnych/aorus-dashboard/actions/workflows/ci.yml)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
+
 Fan control, power limits and live dashboards for Gigabyte AORUS and AERO
 laptops on Linux.
 

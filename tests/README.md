@@ -24,6 +24,12 @@ Coverage so far:
 | `test_profiles.py` | the shipped config, profile application, and how refusals are reported |
 | `test_commands.py` | the argv handed to `nvidia-smi` and `systemctl`, and how replies are read |
 | `test_daemon.py` | curve interpolation, hysteresis, the thermal guard, and handover |
+| `test_repo.py` | file modes, shebangs, line endings, and the systemd units |
+| `test_extension.py` | extension metadata, settings schema, and stylesheet consistency |
+
+CI runs the same suite on Python 3.11, 3.12 and 3.13, plus shellcheck, a GNOME
+extension build check, and a guard against scripts being committed without the
+executable bit. See `.github/workflows/ci.yml`.
 
 Bugs these caught on the way in:
 
@@ -33,3 +39,6 @@ Bugs these caught on the way in:
   thirty times instead of fifteen.
 - Profiles silently ignored keys the tool did not understand, so a typo looked
   like it had applied.
+- `install.sh` executed `secureboot.sh` directly, so a lost executable bit made
+  the Secure Boot step fail and the install carried on to build a module it
+  could not sign.
