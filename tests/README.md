@@ -21,3 +21,15 @@ Coverage so far:
 | `test_state.py` | what gets recorded, and that `reset` puts all of it back |
 | `test_validation.py` | clamping and range checks on every write path |
 | `test_curves.py` | curve parsing, encoding, and that a rejected curve writes nothing |
+| `test_profiles.py` | the shipped config, profile application, and how refusals are reported |
+| `test_commands.py` | the argv handed to `nvidia-smi` and `systemctl`, and how replies are read |
+| `test_daemon.py` | curve interpolation, hysteresis, the thermal guard, and handover |
+
+Bugs these caught on the way in:
+
+- `reset` forced the fans to normal on a machine it had never touched.
+- `aorusctl fan curve garbage` ended in a Python traceback.
+- `set_curve` re-read the firmware curve on every call, writing the index node
+  thirty times instead of fifteen.
+- Profiles silently ignored keys the tool did not understand, so a typo looked
+  like it had applied.

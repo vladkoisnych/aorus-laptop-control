@@ -26,7 +26,7 @@ import threading
 import time
 from pathlib import Path
 
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 
 # ----------------------------------------------------------------------------
 # paths
@@ -1205,6 +1205,15 @@ def cmd_mon(args):
 # config / profiles
 # ----------------------------------------------------------------------------
 
+# Everything a profile may contain. Anything else is a typo worth reporting
+# rather than silently ignoring.
+PROFILE_KEYS = {
+    "fan_mode", "fan_speed", "fan_curve", "charge_limit",
+    "cpu_pl1", "cpu_pl2", "max_perf_pct", "turbo", "governor", "epp",
+    "platform_profile",
+    "gpu_power_limit", "gpu_clocks", "gpu_boost",
+}
+
 DEFAULT_CONFIG = {
     "daemon": {
         "enabled": True,
@@ -1253,6 +1262,11 @@ def apply_profile(name, cfg=None):
     p = profs[name]
     fans, cpu, gpu = hw()
     applied, skipped = [], []
+
+    unknown = sorted(set(p) - PROFILE_KEYS)
+    if unknown:
+        skipped.append(f"unknown setting{'s' if len(unknown) > 1 else ''}: "
+                       f"{', '.join(unknown)}")
 
     def attempt(label, fn):
         try:
@@ -1376,6 +1390,45 @@ def cmd_reset(args):
 _daemon_stop = threading.Event()
 
 
+def curve_speed(curve, t):
+    """Duty for a temperature, linearly interpolated between curve points.
+
+    `curve` is a sorted list of (temperature, duty) pairs. Below the first point
+    and above the last one the curve is flat.
+    """
+    if not curve:
+        return 0.0
+    if t <= curve[0][0]:
+        return curve[0][1]
+    if t >= curve[-1][0]:
+        return curve[-1][1]
+    for i in range(1, len(curve)):
+        t0, s0 = curve[i - 1]
+        t1, s1 = curve[i]
+        if t <= t1:
+            if t1 == t0:
+                return s1
+            return s0 + (s1 - s0) * (t - t0) / (t1 - t0)
+    return curve[-1][1]
+
+
+def daemon_target(curve, t, applied, *, hysteresis=3.0, guard_temp=92.0,
+                  guard_speed=100.0, min_speed=0.0):
+    """The duty the daemon should ask for, as a whole percentage.
+
+    Above `guard_temp` the curve is ignored and the floor is dropped, so the
+    guard can always reach full speed. Below it, duty only comes back down once
+    the temperature has fallen by `hysteresis` degrees, which stops the fans
+    hunting around a curve point.
+    """
+    want = guard_speed if t >= guard_temp else curve_speed(curve, t)
+    if applied is not None and want < applied and t < guard_temp:
+        if curve_speed(curve, t + hysteresis) >= applied:
+            want = applied
+    floor = min_speed if t < guard_temp else 0
+    return int(round(clamp(want, floor, 100)))
+
+
 def _restore_on_exit():
     try:
         fans = hw()[0]
@@ -1425,20 +1478,6 @@ def cmd_daemon(args):
     guard_s = float(d.get("guard_speed", 100))
     min_s = float(d.get("min_speed", 0))
 
-    def curve_speed(t):
-        if t <= curve[0][0]:
-            return curve[0][1]
-        if t >= curve[-1][0]:
-            return curve[-1][1]
-        for i in range(1, len(curve)):
-            t0, s0 = curve[i - 1]
-            t1, s1 = curve[i]
-            if t <= t1:
-                if t1 == t0:
-                    return s1
-                return s0 + (s1 - s0) * (t - t0) / (t1 - t0)
-        return curve[-1][1]
-
     for sig in (signal.SIGTERM, signal.SIGINT):
         try:
             signal.signal(sig, lambda *_: _daemon_stop.set())
@@ -1464,12 +1503,9 @@ def cmd_daemon(args):
             t = max(temps) if temps else 0.0
             peak = max(peak, t)
 
-            want = guard_s if t >= guard_t else curve_speed(t)
-            # hysteresis: only ease off once the temperature has genuinely dropped
-            if applied is not None and want < applied:
-                if curve_speed(t + hyst) >= applied and t < guard_t:
-                    want = applied
-            want = int(round(clamp(want, min_s if t < guard_t else 0, 100)))
+            want = daemon_target(curve, t, applied, hysteresis=hyst,
+                                 guard_temp=guard_t, guard_speed=guard_s,
+                                 min_speed=min_s)
 
             # Reassert every tick, not only when the target duty changes. The old
             # behaviour let an external `fan mode normal` stand until the

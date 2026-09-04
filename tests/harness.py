@@ -216,6 +216,17 @@ class Rig:
 
         ac.wr = wr
         ac.run = self.run
+
+        # Real sleeps only make the suite slow; the read-back delay after a GPU
+        # write has nothing to wait for here.
+        import time as _time
+        self.slept = []
+
+        def _sleep(secs):
+            self.slept.append(secs)
+
+        ac.time = SimpleNamespace(sleep=_sleep, monotonic=_time.monotonic,
+                                  time=_time.time)
         ac.is_root = lambda: root
         if root:
             ac.need_root = lambda: None
