@@ -22,7 +22,7 @@
     font-size: 12px;
     font-weight: 500;
     font-feature-settings: "tnum";
-    text-shadow: 0 0 1px rgba(0, 0, 0, 0.55);
+    /*text-shadow: 0 0 1px rgba(0, 0, 0, 0.55); */
 }
 
 /* ---- popup ---- */
@@ -108,7 +108,7 @@
 
 .aorusctl-light .aorusctl-panel-label,
 .aorusctl-light.aorusctl-panel-label {
-    text-shadow: 0 0 1px rgba(255, 255, 255, 0.75);
+    /*text-shadow: 0 0 1px rgba(255, 255, 255, 0.75); */
 }
 
 .aorusctl-light .aorusctl-btn-on {
