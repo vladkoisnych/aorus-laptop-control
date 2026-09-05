@@ -1,6 +1,6 @@
-# aorus-dashboard
+# aorus-laptop-control
 
-[![ci](https://github.com/vladkoisnych/aorus-dashboard/actions/workflows/ci.yml/badge.svg)](https://github.com/vladkoisnych/aorus-dashboard/actions/workflows/ci.yml)
+[![ci](https://github.com/vladkoisnych/aorus-laptop-control/actions/workflows/ci.yml/badge.svg)](https://github.com/vladkoisnych/aorus-laptop-control/actions/workflows/ci.yml)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
 
@@ -71,8 +71,8 @@ are welcome as issues.
 ## Install
 
 ```sh
-git clone https://github.com/vladkoisnych/aorus-dashboard
-cd aorus-dashboard
+git clone https://github.com/vladkoisnych/aorus-laptop-control
+cd aorus-laptop-control
 sudo ./install.sh --check     # see what it would do, changes nothing
 sudo ./install.sh
 ```
