@@ -5,7 +5,8 @@ Standard library only, same as the tool. From the repository root:
 ```sh
 python3 -m unittest discover -s tests -t tests          # everything
 python3 -m unittest discover -s tests -t tests -v       # with names
-python3 -m unittest -t tests tests.test_curves          # one file
+cd tests && python3 -m unittest test_curves             # one file
+cd tests && python3 -m unittest test_curves.TestCurveCli.test_a_valid_curve_switches_to_custom_mode
 ```
 
 `harness.py` builds a throwaway sysfs tree that mirrors a real AORUS 16X ASG,
@@ -26,6 +27,10 @@ Coverage so far:
 | `test_daemon.py` | curve interpolation, hysteresis, the thermal guard, and handover |
 | `test_repo.py` | file modes, shebangs, line endings, and the systemd units |
 | `test_extension.py` | extension metadata, settings schema, and stylesheet consistency |
+
+`test_repo.py` also keeps `VERSION` in step with `CHANGELOG.md`, so a release
+cannot be tagged against the wrong notes. CI adds a `release` job on `v*` tags
+that refuses a tag which disagrees with either.
 
 CI runs the same suite on Python 3.11, 3.12 and 3.13, plus shellcheck, a GNOME
 extension build check, and a guard against scripts being committed without the

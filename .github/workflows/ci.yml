@@ -3,6 +3,7 @@ name: ci
 on:
   push:
     branches: ["**"]
+    tags: ["v*"]
   pull_request:
   workflow_dispatch:
 
@@ -100,6 +101,33 @@ jobs:
           test -f /tmp/pack/extension.js
           test -f /tmp/pack/stylesheet.css
           python3 -c "import json,sys; m=json.load(open('/tmp/pack/metadata.json')); print('uuid', m['uuid'])"
+
+  release:
+    name: release guard
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: The tag must match VERSION and the changelog
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          version=$(python3 - <<'PY'
+          import re
+          src = open("aorusctl").read()
+          print(re.search(r'^VERSION = "([^"]+)"', src, re.M).group(1))
+          PY
+          )
+          echo "tag=$tag  VERSION=$version"
+          if [ "$tag" != "$version" ]; then
+            echo "::error::tag v$tag does not match VERSION $version in aorusctl"
+            exit 1
+          fi
+          if ! grep -q "^## \[$version\]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no entry for $version"
+            exit 1
+          fi
+          echo "tag, VERSION and changelog agree"
 
   permissions:
     name: file modes
