@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Troubleshooting guide
+    url: https://github.com/vladkoisnych/aorus-laptop-control/blob/master/TROUBLESHOOTING.md
+    about: Fans unavailable, Secure Boot, GPU limits that will not move, and errors that look like permission problems but are not. Worth a look before filing.

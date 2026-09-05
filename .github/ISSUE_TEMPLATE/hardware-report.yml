@@ -1,0 +1,86 @@
+name: Hardware report
+description: Tell us whether this works on your Gigabyte laptop, whatever the answer
+title: "[hardware] "
+labels: ["hardware-report"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Reports are useful whether it worked or not. A model that does not work
+        is worth just as much as one that does, because it tells the next person
+        with the same laptop not to bother.
+
+        The one thing that makes a report actionable is the probe report. It is
+        read only and writes nothing outside its own output file:
+
+        ```sh
+        sudo ./probe.sh
+        ```
+
+  - type: input
+    id: model
+    attributes:
+      label: Model
+      description: |
+        Paste the output of:
+        `cat /sys/class/dmi/id/product_name /sys/class/dmi/id/product_family`
+      placeholder: "AORUS 16X ASG / AORUS"
+    validations:
+      required: true
+
+  - type: input
+    id: silicon
+    attributes:
+      label: CPU and GPU
+      placeholder: "i7-14650HX, RTX 4070 Laptop"
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Distribution and kernel
+      description: "`uname -r` and whatever `lsb_release -d` or /etc/os-release says"
+      placeholder: "Ubuntu 24.04, 6.8.0-138-generic"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: outcome
+    attributes:
+      label: How did it go?
+      options:
+        - Everything worked
+        - Fans worked, something else did not
+        - Fans did not work, CPU and GPU control did
+        - Nothing worked
+        - The installer failed before I got that far
+    validations:
+      required: true
+
+  - type: textarea
+    id: probe
+    attributes:
+      label: Probe report
+      description: |
+        Drag `aorus-probe-report.txt` into this box to attach it, or paste it.
+        It contains DMI strings, firmware and hardware details for this machine.
+        Read it first if you would rather not share any of that.
+      placeholder: "Drag the file here"
+    validations:
+      required: true
+
+  - type: textarea
+    id: status
+    attributes:
+      label: Output of `aorusctl status`
+      description: Only if you got far enough to run it.
+      render: text
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything else
+      description: |
+        What you expected, what happened instead, anything that looked wrong.
+        If the fans behaved oddly, say what mode you were in.
