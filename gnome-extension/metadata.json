@@ -3,7 +3,7 @@
   "name": "aorusctl",
   "description": "CPU and GPU temperatures, fan speed and fan mode in the top bar, with quick fan mode switching and a shortcut to the aorusctl dashboard. Reads from a running aorusctl web service, and falls back to sysfs for temperatures when it is not running.",
   "shell-version": ["45", "46", "47", "48", "49"],
-  "url": "https://github.com/vladkoisnych/aorus-dashboard",
+  "url": "https://github.com/vladkoisnych/aorus-laptop-control",
   "settings-schema": "org.gnome.shell.extensions.aorusctl",
   "version": 1
 }
