@@ -232,8 +232,18 @@ class Rig:
             ac.need_root = lambda: None
         ac.daemon_active = lambda: False
 
-        if nvidia:
-            ac.shutil = type("s", (), {"which": staticmethod(lambda n: "/usr/bin/nvidia-smi")})
+        # Always stub this. Leaving it to the host means the suite passes on a
+        # machine without an NVIDIA GPU and fails on one with it, which is
+        # exactly backwards for a tool aimed at gaming laptops.
+        import shutil as _shutil
+        real_which = _shutil.which
+
+        def which(name, *a, **k):
+            if name == "nvidia-smi":
+                return "/usr/bin/nvidia-smi" if nvidia else None
+            return real_which(name, *a, **k)
+
+        ac.shutil = SimpleNamespace(which=which)
         ac.FANS = ac.CPU = ac.GPU = None
 
     # -- convenience

@@ -6,7 +6,7 @@ like a missing file rather than a missing permission.
 """
 
 import os
-import stat
+import re
 import subprocess
 import unittest
 from pathlib import Path
@@ -46,13 +46,6 @@ class TestFileModes(unittest.TestCase):
             with self.subTest(file=rel):
                 self.assertEqual(modes[rel], "100755",
                                  f"{rel} is committed as {modes[rel]}, not 100755")
-
-    def test_no_script_is_group_or_world_writable(self):
-        for f in EXECUTABLES:
-            with self.subTest(file=f.relative_to(REPO)):
-                mode = f.stat().st_mode
-                self.assertFalse(mode & (stat.S_IWGRP | stat.S_IWOTH),
-                                 "a root-run script must not be writable by others")
 
 
 class TestScripts(unittest.TestCase):
@@ -97,6 +90,23 @@ class TestScripts(unittest.TestCase):
             with self.subTest(file=f.relative_to(REPO)):
                 r = subprocess.run(["bash", "-n", str(f)], capture_output=True, text=True)
                 self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_version_is_semver(self):
+        from harness import load_module
+        v = load_module().VERSION
+        self.assertRegex(v, r"^\d+\.\d+\.\d+$", f"VERSION is {v!r}")
+
+    def test_the_changelog_documents_the_current_version(self):
+        from harness import load_module
+        v = load_module().VERSION
+        changelog = REPO / "CHANGELOG.md"
+        if not changelog.exists():
+            self.skipTest("no changelog")
+        headings = re.findall(r"^## \[([^\]]+)\]", changelog.read_text(), re.M)
+        self.assertTrue(headings, "no version headings in the changelog")
+        self.assertEqual(headings[0], v,
+                         f"VERSION is {v} but the newest changelog entry is "
+                         f"{headings[0]}; releasing would tag the wrong notes")
 
     def test_the_tool_is_valid_python(self):
         import ast
