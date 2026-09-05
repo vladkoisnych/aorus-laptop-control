@@ -96,6 +96,29 @@ class TestRollback(RigTest):
         self.assertEqual(code, 0)
         self.assertIn("nothing to undo", out)
 
+    def test_reset_leaves_an_untouched_gpu_alone(self):
+        # Unlocking clocks or restoring a power limit we never set would
+        # override whatever the user had configured themselves.
+        from harness import Rig
+        rig = Rig(nvidia=True)
+        self.addCleanup(rig.close)
+        code, out = rig.cli("reset")
+        self.assertEqual(code, 0)
+        self.assertIn("nothing to undo", out)
+        self.assertEqual(rig.run.argv("nvidia-smi"), [])
+
+    def test_reset_does_restore_a_gpu_we_changed(self):
+        from harness import Rig
+        rig = Rig(nvidia=True)
+        self.addCleanup(rig.close)
+        rig.run.reply("--query-gpu=name", stdout=(
+            "NVIDIA GeForce RTX 4070 Laptop GPU, 44, 0, 0, 2.7, 95.00, 95.00, "
+            "5.00, 140.00, 210, 405, 1269, 8188, [N/A]"))
+        rig.gpu.set_clocks(210, 1800)
+        rig.run.calls.clear()
+        _, out = rig.cli("reset")
+        self.assertTrue(rig.run.ran("nvidia-smi", "-rgc"), out)
+
     def test_reset_restores_fan_mode_last(self):
         # Restoring duty after the mode would leave the fans briefly wrong
         self.rig.fans.set_mode("fixed")

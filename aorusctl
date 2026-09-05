@@ -26,7 +26,7 @@ import threading
 import time
 from pathlib import Path
 
-VERSION = "1.6.0"
+VERSION = "0.1.0"
 
 # ----------------------------------------------------------------------------
 # paths
@@ -1366,7 +1366,11 @@ def cmd_reset(args):
         except Err as e:
             msgs.append(f"! fan mode: {e}")
 
-    if gpu.available:
+    # Only if we actually changed something on the GPU. Unlocking clocks or
+    # restoring a power limit we never set would override whatever the user had.
+    gpu_touched = ("gpu_power_limit" in orig or "gpu_persistence" in orig
+                   or STATE.current("gpu_clocks") is not None)
+    if gpu.available and gpu_touched:
         msgs += gpu.reset()
         if STATE.original("gpu_persistence") == 0 and not DRY_RUN:
             if run([gpu.smi, "-pm", "0"]):
