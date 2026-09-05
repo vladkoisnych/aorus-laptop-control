@@ -13,6 +13,11 @@ cat_if() { if [ -r "$1" ]; then printf '%-64s = %s\n' "$1" "$(tr -d '\n' < "$1" 
 printf 'aorusctl probe report\n'
 printf 'generated: %s\n' "$(date -Is)"
 printf 'euid: %s\n' "$EUID"
+printf '\nThis file describes the machine: model, firmware, sensors, kernel\n'
+printf 'interfaces and GPU capabilities. Username and hostname are replaced\n'
+printf 'with placeholders before it is written. It is meant to be attached to\n'
+printf 'a hardware report; read it first if you would rather not share any of\n'
+printf 'it.\n'
 
 sec "IDENTITY"
 run uname -a
@@ -97,7 +102,7 @@ command -v rdmsr >/dev/null && echo "msr-tools present" || echo "msr-tools absen
 [ -e /dev/cpu/0/msr ] && echo "/dev/cpu/0/msr exists" || echo "/dev/cpu/0/msr absent"
 
 sec "NVIDIA GPU"
-run nvidia-smi
+run nvidia-smi --query-gpu=name,driver_version,vbios_version,temperature.gpu,power.draw,persistence_mode --format=csv
 run nvidia-smi -q -d POWER
 run nvidia-smi -q -d SUPPORTED_CLOCKS
 run nvidia-smi --query-gpu=name,driver_version,vbios_version,power.limit,power.default_limit,power.min_limit,power.max_limit,clocks.max.sm --format=csv
@@ -128,13 +133,22 @@ else
 fi
 
 sec "EXISTING TOOLING ON THIS MACHINE"
-run bash -c 'ls -d ~/nbfc ~/tuxedo 2>/dev/null'
-run systemctl list-units --type=service --state=running --no-pager
+printf '\n--- leftover tooling in the home directory\n'
+for d in nbfc tuxedo; do
+  if [ -d "$HOME/$d" ]; then echo "home directory has $d/"; else echo "no $d/ in home directory"; fi
+done
 run bash -c 'systemctl list-unit-files --no-pager | grep -i "nbfc\|tuxedo\|fan\|thermald\|power-profiles\|tlp"'
+run bash -c 'systemctl is-active nvidia-powerd aorusctld aorusctl-web 2>&1'
 
 sec "END"
 printf 'report complete\n'
 } > "$OUT" 2>&1
+
+# Scrub the two things that identify the person rather than the laptop.
+HOST=$(hostname 2>/dev/null)
+[ -n "${USER:-}" ] && sed -i "s/\b${USER}\b/USER/g" "$OUT" 2>/dev/null
+[ -n "$HOST" ] && sed -i "s/\b${HOST}\b/HOSTNAME/g" "$OUT" 2>/dev/null
+sed -i 's|/home/[^/ :]*|/home/USER|g' "$OUT" 2>/dev/null
 
 echo "Report written to: $OUT"
 echo "Size: $(wc -c < "$OUT") bytes"
