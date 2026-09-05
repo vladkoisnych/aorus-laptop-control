@@ -12,7 +12,12 @@ sudo ./probe.sh          # writes aorus-probe-report.txt next to the script
 It only reads. The report covers DMI strings, which WMI GUIDs your firmware
 exposes, the hwmon tree, RAPL domains, `intel_pstate`, `nvidia-smi`
 capabilities, whether the DSDT contains `WMBC` and `WMBD`, and what fan software
-is already running. Attach it to an issue.
+is already installed.
+
+It describes the machine rather than you: your username and hostname are
+replaced with placeholders before the file is written, and it does not collect
+your running services, the processes using the GPU, or any serial numbers. Read
+it before attaching it to an issue if you would rather not share any of it.
 
 ## The FANS section says unavailable
 

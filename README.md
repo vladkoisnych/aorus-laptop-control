@@ -4,6 +4,8 @@
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
 
+Disclaimer: Not affiliated with Gigabyte, AORUS or other manufacturers.
+
 Fan control, power limits and live dashboards for Gigabyte AORUS and AERO
 laptops on Linux.
 
